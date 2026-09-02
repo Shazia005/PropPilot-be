@@ -5,7 +5,7 @@ import connectDB from './src/config/db.js';
 import authRoutes from './src/routes/authRoutes.js';
 import propertyRoutes from './src/routes/propertyRoutes.js';
 import inquiryRoutes from './src/routes/inquiryRoutes.js';
-import aiRoutes from './routes/aiRoutes.js';
+import aiRoutes from './src/routes/aiRoutes.js'; // Updated path
 
 dotenv.config();
 
@@ -21,6 +21,7 @@ app.use('/api/auth', authRoutes);
 app.use('/api/properties', propertyRoutes);
 app.use('/api/inquiries', inquiryRoutes);
 app.use('/api/ai', aiRoutes);
+
 app.get('/api/health', (req, res) => {
   res.status(200).json({ status: 'OK', message: 'EstateAI API running' });
 });
