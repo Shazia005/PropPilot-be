@@ -17,7 +17,7 @@ async function getBrowser() {
         '--disable-dev-shm-usage',
         '--disable-accelerated-2d-canvas',
         '--disable-gpu',
-        '--single-process'
+        // REMOVED: '--single-process' - causes memory leaks under load
       ],
     });
   }
