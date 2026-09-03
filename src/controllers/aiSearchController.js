@@ -29,7 +29,7 @@ export const autonomousSearch = async (req, res) => {
     // Step 1: Extract criteria with a 10s timeout
     const intentResponse = await withTimeout(
       ai.models.generateContent({
-        model: 'gemini-3.6-flash',
+        model: 'gemini-2.0-flash', // ✅ FIXED: Changed from gemini-3.6-flash
         contents: `Extract real estate search criteria from this prompt: "${prompt}".`,
         config: {
           responseMimeType: 'application/json',
@@ -103,7 +103,7 @@ export const autonomousSearch = async (req, res) => {
     // Step 3: Format output with 15s timeout
     const normalizationResponse = await withTimeout(
       ai.models.generateContent({
-        model: 'gemini-3.6-flash',
+        model: 'gemini-2.0-flash', // ✅ FIXED: Changed from gemini-3.6-flash
         contents: `Format raw property listings into valid property cards matching user prompt: "${prompt}". 
         Extracted criteria: ${JSON.stringify(criteria)}
         Raw data: ${JSON.stringify(validData)}`,
@@ -194,7 +194,7 @@ export const propertyChat = async (req, res) => {
 
     const response = await withTimeout(
       ai.models.generateContent({
-        model: 'gemini-3.6-flash',
+        model: 'gemini-2.0-flash', // ✅ FIXED: Changed from gemini-3.6-flash
         contents: promptContent,
       }),
       10000
