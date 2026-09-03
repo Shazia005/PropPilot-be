@@ -1,5 +1,29 @@
 import puppeteer from 'puppeteer';
 
+// Browser singleton instance
+let browserInstance = null;
+
+// Concurrency rate limiting
+let activeScrapers = 0;
+const MAX_CONCURRENT_SCRAPERS = 2;
+
+async function getBrowser() {
+  if (!browserInstance || !browserInstance.isConnected()) {
+    browserInstance = await puppeteer.launch({
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--disable-gpu',
+        '--single-process'
+      ],
+    });
+  }
+  return browserInstance;
+}
+
 const formatCity = (city) => {
   if (!city) return 'Lahore';
   return city
@@ -19,25 +43,21 @@ const formatPropertyType = (type = '') => {
 };
 
 export async function scrapeListings(city = 'Lahore', propertyType = 'House') {
-  let browser;
+  // Queue requests if max concurrency is reached
+  while (activeScrapers >= MAX_CONCURRENT_SCRAPERS) {
+    await new Promise((resolve) => setTimeout(resolve, 800));
+  }
+
+  activeScrapers++;
+  let page;
+
   try {
-    browser = await puppeteer.launch({
-      headless: true,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
-        '--disable-gpu'
-      ],
-    });
+    const browser = await getBrowser();
+    page = await browser.newPage();
 
-    const page = await browser.newPage();
-
-    // Abort heavy media, but keep stylesheets for dynamic layout rendering
     await page.setRequestInterception(true);
     page.on('request', (req) => {
-      if (['image', 'media', 'font'].includes(req.resourceType())) {
+      if (['image', 'media', 'font', 'stylesheet', 'other'].includes(req.resourceType())) {
         req.abort();
       } else {
         req.continue();
@@ -50,36 +70,52 @@ export async function scrapeListings(city = 'Lahore', propertyType = 'House') {
 
     const formattedCity = formatCity(city);
     const formattedType = formatPropertyType(propertyType);
-    
     const targetUrl = `https://www.zameen.com/${formattedType}/${formattedCity}-3-1.html`;
 
-    await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 25000 });
+    console.log(`[Scraper] Accessing: ${targetUrl}`);
+    await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+
+    // Wait for listing articles safely
+    await page.waitForSelector('li[role="article"], article, div[aria-label="Listing"]', { timeout: 4000 }).catch(() => null);
 
     const rawListings = await page.evaluate(() => {
       const items = Array.from(document.querySelectorAll('li[role="article"], article, div[aria-label="Listing"]'));
 
       return items.slice(0, 10).map((el, idx) => {
-        const titleEl = el.querySelector('h2, [aria-label="Title"], a[title]');
-        const priceEl = el.querySelector('[aria-label="Price"], span[title*="PKR"], span[class*="f343d9ac"]');
-        const locationEl = el.querySelector('[aria-label="Location"], div[aria-label="Listing location"]');
-        const linkEl = el.querySelector('a');
+        try {
+          const titleEl = el.querySelector('h2, [aria-label="Title"], a[title]');
+          const priceEl = el.querySelector('[aria-label="Price"], span[title*="PKR"], span[class*="f343d9ac"]');
+          const locationEl = el.querySelector('[aria-label="Location"], div[aria-label="Listing location"]');
+          const linkEl = el.querySelector('a');
 
-        return {
-          rawId: `zam-${idx + 1}`,
-          rawTitle: titleEl ? titleEl.textContent.trim() : '',
-          rawPrice: priceEl ? priceEl.textContent.trim() : '',
-          rawLocation: locationEl ? locationEl.textContent.trim() : '',
-          rawLink: linkEl ? linkEl.href : ''
-        };
-      }).filter(item => item.rawTitle || item.rawPrice);
+          const title = titleEl ? titleEl.textContent.trim() : '';
+          const price = priceEl ? priceEl.textContent.trim() : '';
+          const location = locationEl ? locationEl.textContent.trim() : '';
+          const link = linkEl ? linkEl.href : '';
+
+          return {
+            rawId: link ? link.split('/').pop().replace('.html', '') : `zam-${idx + 1}`,
+            rawTitle: title,
+            rawPrice: price,
+            rawLocation: location,
+            rawLink: link
+          };
+        } catch (e) {
+          return null;
+        }
+      }).filter((item) => item && (item.rawTitle || item.rawPrice));
     });
 
-    await browser.close();
-    return rawListings;
+    await page.close();
+    return rawListings || [];
 
   } catch (error) {
-    if (browser) await browser.close();
-    console.error('Scraper Error:', error.message);
+    if (page) {
+      try { await page.close(); } catch (e) {}
+    }
+    console.error('[Scraper Error]:', error.message);
     return [];
+  } finally {
+    activeScrapers--;
   }
 }
