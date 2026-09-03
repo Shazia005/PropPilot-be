@@ -1,3 +1,4 @@
+// inquiryRoutes.js
 import express from 'express';
 import { createInquiry, getInquiries } from '../controllers/inquiryController.js';
 

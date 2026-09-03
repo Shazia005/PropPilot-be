@@ -1,7 +1,7 @@
 import { GoogleGenAI, Type } from '@google/genai';
 import { scrapeListings } from '../services/scraper.js';
-import Property from '../models/Property.js';
 
+// Controller 1: Autonomous Search & Listing Normalization
 export const autonomousSearch = async (req, res) => {
   try {
     const { prompt } = req.body;
@@ -16,9 +16,9 @@ export const autonomousSearch = async (req, res) => {
 
     const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
-    // Step 1: Extract criteria using Gemini
+    // Step 1: Extract criteria using Gemini 3.6 Flash
     const intentResponse = await ai.models.generateContent({
-      model: 'gemini-3.6-flash', // FIXED: Updated model string
+      model: 'gemini-3.6-flash',
       contents: `Extract real estate search criteria from this prompt: "${prompt}".`,
       config: {
         responseMimeType: 'application/json',
@@ -37,37 +37,28 @@ export const autonomousSearch = async (req, res) => {
 
     const criteria = JSON.parse(intentResponse.text);
 
-    // Step 2: Attempt scraping with DB fallback on error
+    // Step 2: Scrape live listings directly from Zameen.com
     let rawData = [];
     try {
       rawData = await scrapeListings(criteria.city || 'Lahore', criteria.propertyType || 'House');
-    } catch (scrapeErr) {
-      console.warn('Scraper failed or timed out. Falling back to DB search...', scrapeErr.message);
-    }
-
-    if (!rawData || rawData.length === 0) {
-      const dbQuery = {};
-      if (criteria.city) dbQuery.city = { $regex: criteria.city, $options: 'i' };
-      if (criteria.propertyType) dbQuery.type = { $regex: criteria.propertyType, $options: 'i' };
-
-      const dbProperties = await Property.find(dbQuery).limit(10);
       
-      rawData = dbProperties.map((p) => ({
-        id: p._id.toString(),
-        title: p.title,
-        price: p.price,
-        location: p.location,
-        beds: p.bedrooms || 3,
-        baths: p.bathrooms || 3,
-        area: p.areaSqFt ? `${p.areaSqFt} Sq Ft` : '10 Marla',
-        image: p.imageUrl || 'https://via.placeholder.com/400x300',
-        type: p.type
-      }));
+      if (!rawData || rawData.length === 0) {
+        return res.status(404).json({ 
+          message: `No properties found in ${criteria.city} for type ${criteria.propertyType} on Zameen.com.`,
+          properties: []
+        });
+      }
+    } catch (scrapeErr) {
+      console.error('Scraper Error:', scrapeErr.message);
+      return res.status(503).json({ 
+        message: 'Unable to fetch data from Zameen.com. Please try again later.',
+        error: scrapeErr.message 
+      });
     }
 
-    // Step 3: Format response using Gemini
+    // Step 3: Format and normalize scraped results using Gemini 3.6 Flash
     const normalizationResponse = await ai.models.generateContent({
-      model: 'gemini-3.6-flash', // FIXED: Updated model string
+      model: 'gemini-3.6-flash',
       contents: `Format raw property listings into valid property cards matching user prompt: "${prompt}". 
       Extracted criteria: ${JSON.stringify(criteria)}
       Raw data: ${JSON.stringify(rawData)}`,
@@ -109,6 +100,43 @@ export const autonomousSearch = async (req, res) => {
     return res.status(500).json({ 
       message: 'Search processing failed.', 
       error: error.message 
+    });
+  }
+};
+
+// Controller 2: Interactive Property Assistant Chat
+export const propertyChat = async (req, res) => {
+  try {
+    const { message, propertyContext } = req.body;
+
+    if (!message) {
+      return res.status(400).json({ message: 'Message is required' });
+    }
+
+    if (!process.env.GEMINI_API_KEY) {
+      return res.status(500).json({ message: 'GEMINI_API_KEY missing in .env file' });
+    }
+
+    const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+
+    let promptContent = message;
+    if (propertyContext) {
+      promptContent = `You are an expert real estate consultant. Context of the property being discussed: ${JSON.stringify(propertyContext)}. User question: ${message}`;
+    }
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-3.6-flash',
+      contents: promptContent,
+    });
+
+    return res.status(200).json({
+      reply: response.text,
+    });
+  } catch (error) {
+    console.error('Property Chat Error:', error);
+    return res.status(500).json({
+      message: 'Failed to generate chat response.',
+      error: error.message,
     });
   }
 };

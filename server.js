@@ -5,7 +5,7 @@ import connectDB from './src/config/db.js';
 import authRoutes from './src/routes/authRoutes.js';
 import propertyRoutes from './src/routes/propertyRoutes.js';
 import inquiryRoutes from './src/routes/inquiryRoutes.js';
-import aiRoutes from './src/routes/aiRoutes.js'; // Updated path
+import aiRoutes from './src/routes/aiRoutes.js';
 
 dotenv.config();
 
@@ -24,6 +24,15 @@ app.use('/api/ai', aiRoutes);
 
 app.get('/api/health', (req, res) => {
   res.status(200).json({ status: 'OK', message: 'EstateAI API running' });
+});
+
+// Centralized Error Handler
+app.use((err, req, res, next) => {
+  const statusCode = res.statusCode === 200 ? 500 : res.statusCode;
+  res.status(statusCode).json({
+    message: err.message,
+    stack: process.env.NODE_ENV === 'production' ? null : err.stack,
+  });
 });
 
 const PORT = process.env.PORT || 5000;

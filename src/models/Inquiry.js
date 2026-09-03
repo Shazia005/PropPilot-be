@@ -2,10 +2,12 @@ import mongoose from 'mongoose';
 
 const inquirySchema = new mongoose.Schema(
   {
-    property: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: 'Property',
+    propertyId: {
+      type: String,
       required: true,
+    },
+    propertyTitle: {
+      type: String,
     },
     name: {
       type: String,
@@ -29,9 +31,7 @@ const inquirySchema = new mongoose.Schema(
       default: null,
     },
   },
-  {
-    timestamps: true,
-  }
+  { timestamps: true }
 );
 
 export default mongoose.model('Inquiry', inquirySchema);
