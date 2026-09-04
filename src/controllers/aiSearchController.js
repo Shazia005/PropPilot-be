@@ -1,215 +1,733 @@
-import { GoogleGenAI, Type } from '@google/genai';
-import { scrapeListings } from '../services/scraper.js';
+import { GoogleGenAI, Type } from "@google/genai";
+import { scrapeListings } from "../services/scraper.js";
 
-// Helper: Wrap async tasks with strict timeouts
+const GEMINI_MODEL = "gemini-3.6-flash";
+const GEMINI_TIMEOUT = 30000;
+
+// Initialize Gemini only if API key exists
+const ai = process.env.GEMINI_API_KEY
+  ? new GoogleGenAI({
+      apiKey: process.env.GEMINI_API_KEY,
+    })
+  : null;
+
+/* =========================================================
+   TIMEOUT HELPER
+========================================================= */
+
 const withTimeout = (promise, ms) => {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(`Operation timed out after ${ms}ms`)), ms)
-    )
-  ]);
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error("Operation timed out after " + ms + "ms"));
+    }, ms);
+
+    promise
+      .then((result) => {
+        clearTimeout(timer);
+        resolve(result);
+      })
+      .catch((error) => {
+        clearTimeout(timer);
+        reject(error);
+      });
+  });
 };
 
-// Controller 1: Autonomous Search & Listing Normalization
+/* =========================================================
+   PRICE PARSER
+========================================================= */
+
+const extractPriceInCrores = (price) => {
+  if (!price) return 0;
+
+  const text = String(price).toLowerCase().replace(/,/g, "");
+
+  // Example: 2.5 Crore
+  const croreMatch = text.match(/([\d.]+)\s*crore/);
+
+  if (croreMatch) {
+    return Number(croreMatch[1]);
+  }
+
+  // Example: 25 Million
+  const millionMatch = text.match(/([\d.]+)\s*million/);
+
+  if (millionMatch) {
+    return Number(millionMatch[1]) / 10;
+  }
+
+  // Example: 25000000
+  const numberMatch = text.match(/[\d.]+/);
+
+  if (numberMatch) {
+    const value = Number(numberMatch[0]);
+
+    if (value >= 10000000) {
+      return value / 10000000;
+    }
+  }
+
+  return 0;
+};
+
+/* =========================================================
+   NORMALIZE SCRAPED PROPERTY
+========================================================= */
+
+const normalizeProperty = (property, index) => {
+  if (!property || typeof property !== "object") {
+    return null;
+  }
+
+  const id =
+    property.id ||
+    property._id ||
+    property.propertyId ||
+    property.rawId ||
+    `ai-property-${index}-${Date.now()}`;
+
+  return {
+    id: String(id),
+
+    title:
+      property.title ||
+      property.name ||
+      property.rawTitle ||
+      "Property Listing",
+
+    price:
+      property.price ||
+      property.priceText ||
+      property.amount ||
+      property.rawPrice ||
+      "Price not available",
+
+    location:
+      property.location ||
+      property.address ||
+      property.rawLocation ||
+      property.city ||
+      "Location not available",
+
+    beds:
+      property.beds ??
+      property.bedrooms ??
+      property.bedroom ??
+      property.rawBedrooms ??
+      0,
+
+    bedrooms:
+      property.bedrooms ??
+      property.beds ??
+      property.bedroom ??
+      property.rawBedrooms ??
+      0,
+
+    baths:
+      property.baths ??
+      property.bathrooms ??
+      property.bathroom ??
+      property.rawBathrooms ??
+      0,
+
+    bathrooms:
+      property.bathrooms ??
+      property.baths ??
+      property.bathroom ??
+      property.rawBathrooms ??
+      0,
+
+    area:
+      property.area ||
+      property.areaSqFt ||
+      property.sqft ||
+      property.size ||
+      property.rawArea ||
+      "N/A",
+
+    areaSqFt:
+      property.areaSqFt ||
+      property.sqft ||
+      property.area ||
+      property.rawArea ||
+      "N/A",
+
+    image:
+      property.image ||
+      property.imageUrl ||
+      property.img ||
+      property.rawImage ||
+      "",
+
+    imageUrl:
+      property.imageUrl ||
+      property.image ||
+      property.rawImage ||
+      "",
+
+    type:
+      property.type ||
+      property.propertyType ||
+      "Property",
+
+    sourceUrl:
+      property.sourceUrl ||
+      property.url ||
+      property.link ||
+      property.rawLink ||
+      "",
+  };
+};
+
+/* =========================================================
+   UNIQUE IDS
+========================================================= */
+
+const makeUniqueIds = (properties) => {
+  const usedIds = new Set();
+
+  return properties.map((property, index) => {
+    let id = String(property.id || `property-${index}`);
+
+    if (usedIds.has(id)) {
+      id = `${id}-${index}`;
+    }
+
+    usedIds.add(id);
+
+    return {
+      ...property,
+      id,
+    };
+  });
+};
+
+/* =========================================================
+   FALLBACK SEARCH DETECTION
+   Used when Gemini quota is unavailable
+========================================================= */
+
+const detectFallbackCriteria = (prompt) => {
+  const text = String(prompt || "").toLowerCase();
+
+  let city = null;
+  let propertyType = null;
+  let bedrooms = 0;
+  let maxBudgetInCrores = 0;
+
+  // Cities
+  const cities = [
+    "islamabad",
+    "lahore",
+    "karachi",
+    "rawalpindi",
+    "peshawar",
+    "faisalabad",
+    "multan",
+    "quetta",
+  ];
+
+  for (const cityName of cities) {
+    if (text.includes(cityName)) {
+      city = cityName;
+      break;
+    }
+  }
+
+  // Property type
+  if (
+    text.includes("house") ||
+    text.includes("home") ||
+    text.includes("villa")
+  ) {
+    propertyType = "house";
+  } else if (
+    text.includes("apartment") ||
+    text.includes("flat")
+  ) {
+    propertyType = "apartment";
+  } else if (text.includes("plot")) {
+    propertyType = "plot";
+  } else if (
+    text.includes("commercial") ||
+    text.includes("office") ||
+    text.includes("shop")
+  ) {
+    propertyType = "commercial";
+  } else {
+    propertyType = "house";
+  }
+
+  // Bedrooms
+  const bedroomMatch = text.match(
+    /(\d+)\s*(?:bedroom|bedrooms|bed|beds|bhk)/
+  );
+
+  if (bedroomMatch) {
+    bedrooms = Number(bedroomMatch[1]);
+  }
+
+  // Budget
+  const croreMatch = text.match(
+    /(?:under|below|less than|max|maximum|budget(?:\s+of)?|upto|up to)?\s*(\d+(?:\.\d+)?)\s*(?:crore|crores|cr)/
+  );
+
+  if (croreMatch) {
+    maxBudgetInCrores = Number(croreMatch[1]);
+  }
+
+  return {
+    city,
+    propertyType,
+    bedrooms,
+    maxBudgetInCrores,
+  };
+};
+
+/* =========================================================
+   GEMINI ERROR HANDLER
+========================================================= */
+
+const handleGeminiError = (error) => {
+  const message = error?.message || String(error);
+
+  console.error("[Gemini Error]:", message);
+
+  if (
+    message.includes("429") ||
+    message.toLowerCase().includes("quota") ||
+    message.toLowerCase().includes("resource_exhausted")
+  ) {
+    return "Gemini API quota has been exceeded. Please try again later.";
+  }
+
+  if (
+    message.toLowerCase().includes("api key") ||
+    message.toLowerCase().includes("unauthorized") ||
+    message.toLowerCase().includes("permission")
+  ) {
+    return "Gemini API authentication failed. Please check your API key.";
+  }
+
+  if (message.toLowerCase().includes("timed out")) {
+    return "Gemini request timed out. Please try again.";
+  }
+
+  return "AI service is temporarily unavailable.";
+};
+
+/* =========================================================
+   AI AGENT SEARCH
+========================================================= */
+
 export const autonomousSearch = async (req, res) => {
   try {
-    const { prompt } = req.body;
+    const prompt = req.body?.prompt || req.body?.query || "";
 
-    if (!prompt || prompt.trim() === '') {
-      return res.status(400).json({ message: 'Prompt is required' });
-    }
-
-    if (!process.env.GEMINI_API_KEY) {
-      return res.status(500).json({ message: 'GEMINI_API_KEY missing in .env file' });
-    }
-
-    const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-
-    // Step 1: Extract criteria with a 10s timeout
-    const intentResponse = await withTimeout(
-      ai.models.generateContent({
-        model: 'gemini-3.6-flash',
-        contents: `Extract real estate search criteria from this prompt: "${prompt}".`,
-        config: {
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              city: { type: Type.STRING },
-              maxBudgetInCrores: { type: Type.NUMBER },
-              bedrooms: { type: Type.NUMBER },
-              propertyType: { type: Type.STRING }
-            },
-            required: ['city', 'propertyType']
-          }
-        }
-      }),
-      10000
-    );
-
-    let criteria;
-    try {
-      criteria = JSON.parse(intentResponse.text);
-    } catch (parseErr) {
-      return res.status(400).json({ message: 'Failed to process prompt intent.' });
-    }
-
-    // Validate extracted city
-    if (!criteria.city || criteria.city.trim() === '') {
-      return res.status(400).json({ 
-        message: 'Could not determine city from your search. Please specify a Pakistani city.',
-        suggestedCities: ['Islamabad', 'Lahore', 'Karachi', 'Rawalpindi', 'Peshawar']
-      });
-    }
-
-    if (!criteria.propertyType || criteria.propertyType.trim() === '') {
-      criteria.propertyType = 'House';
-    }
-
-    console.log(`[AI Search] City: ${criteria.city} | Type: ${criteria.propertyType}`);
-
-    // Step 2: Scrape live listings
-    let rawData = [];
-    try {
-      rawData = await scrapeListings(criteria.city, criteria.propertyType);
-    } catch (scrapeErr) {
-      console.error('[Scraper Error]:', scrapeErr.message);
-      return res.status(503).json({ 
-        message: 'Unable to fetch data from Zameen.com. Please try again later.',
-        error: scrapeErr.message 
-      });
-    }
-
-    // Validate scraped data presence and layout
-    if (!rawData || rawData.length === 0) {
-      return res.status(404).json({ 
-        message: `No properties found for "${criteria.propertyType}" in "${criteria.city}" on Zameen.com`,
+    if (!prompt.trim()) {
+      return res.status(400).json({
+        message: "Please provide a property search prompt.",
         properties: [],
-        aiSummary: 'No listings currently available in this location.'
       });
     }
 
-    const validData = rawData.filter(item => item.rawTitle || item.rawPrice);
-    if (validData.length === 0) {
-      return res.status(422).json({ 
-        message: 'Scraped data is incomplete or unparseable.',
-        properties: []
-      });
-    }
+    console.log("\n========================================");
+    console.log("[AI Search] User prompt:", prompt);
+    console.log("========================================");
 
-    console.log(`[AI Search] Processing ${validData.length} scraped properties through Gemini...`);
+    let criteria = null;
+    let usedFallback = false;
 
-    // Step 3: Format output with 15s timeout
-    const normalizationResponse = await withTimeout(
-      ai.models.generateContent({
-        model: 'gemini-3.6-flash',
-        contents: `Format raw property listings into valid property cards matching user prompt: "${prompt}". 
-        Extracted criteria: ${JSON.stringify(criteria)}
-        Raw data: ${JSON.stringify(validData)}`,
-        config: {
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              aiSummary: { type: Type.STRING },
-              properties: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    id: { type: Type.STRING },
-                    title: { type: Type.STRING },
-                    price: { type: Type.STRING },
-                    location: { type: Type.STRING },
-                    beds: { type: Type.NUMBER },
-                    baths: { type: Type.NUMBER },
-                    area: { type: Type.STRING },
-                    image: { type: Type.STRING },
-                    type: { type: Type.STRING }
+    /* =====================================================
+       STEP 1: GEMINI INTENT EXTRACTION
+    ===================================================== */
+
+    if (ai) {
+      try {
+        console.log("[AI Search] Extracting search intent...");
+
+        const intentResponse = await withTimeout(
+          ai.models.generateContent({
+            model: GEMINI_MODEL,
+            contents: `
+You are a real estate search assistant.
+
+Analyze the user's property search request and return ONLY valid JSON.
+
+User request:
+"${prompt}"
+
+Return this exact structure:
+
+{
+  "city": "karachi",
+  "propertyType": "house",
+  "bedrooms": 4,
+  "maxBudgetInCrores": 5
+}
+
+Rules:
+- city should be lowercase.
+- propertyType must be one of:
+  house, apartment, plot, commercial
+- bedrooms should be a number. Use 0 if not specified.
+- maxBudgetInCrores should be a number. Use 0 if no budget is specified.
+- Do not include markdown.
+- Do not include explanations.
+            `,
+            config: {
+              responseMimeType: "application/json",
+              responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                  city: {
+                    type: Type.STRING,
                   },
-                  required: ['id', 'title', 'price', 'location']
-                }
-              }
+                  propertyType: {
+                    type: Type.STRING,
+                  },
+                  bedrooms: {
+                    type: Type.NUMBER,
+                  },
+                  maxBudgetInCrores: {
+                    type: Type.NUMBER,
+                  },
+                },
+                required: [
+                  "city",
+                  "propertyType",
+                  "bedrooms",
+                  "maxBudgetInCrores",
+                ],
+              },
             },
-            required: ['aiSummary', 'properties']
-          }
+          }),
+          GEMINI_TIMEOUT
+        );
+
+        const responseText =
+          intentResponse?.text ||
+          intentResponse?.response?.text ||
+          "";
+
+        console.log("[AI Search] Gemini response:", responseText);
+
+        if (!responseText) {
+          throw new Error("Gemini returned an empty response.");
         }
-      }),
-      15000
+
+        criteria = JSON.parse(responseText);
+
+        console.log("[AI Search] Parsed criteria:", criteria);
+      } catch (error) {
+        console.log(
+          "[AI Search] Gemini unavailable. Switching to fallback search."
+        );
+
+        console.log("[AI Search] Reason:", error?.message || error);
+
+        criteria = detectFallbackCriteria(prompt);
+        usedFallback = true;
+
+        console.log("[AI Search] Fallback criteria:", criteria);
+        console.log("[AI Search] FALLBACK MODE ACTIVE");
+      }
+    } else {
+      console.log(
+        "[AI Search] Gemini API key not found. Using fallback search."
+      );
+
+      criteria = detectFallbackCriteria(prompt);
+      usedFallback = true;
+
+      console.log("[AI Search] Fallback criteria:", criteria);
+      console.log("[AI Search] FALLBACK MODE ACTIVE");
+    }
+
+    /* =====================================================
+       STEP 2: VALIDATE CRITERIA
+    ===================================================== */
+
+    if (!criteria) {
+      return res.status(400).json({
+        message: "Unable to understand your property search.",
+        properties: [],
+      });
+    }
+
+    const city = String(criteria.city || "").toLowerCase().trim();
+
+    let propertyType = String(
+      criteria.propertyType || "house"
+    )
+      .toLowerCase()
+      .trim();
+
+    const bedrooms = Number(criteria.bedrooms || 0);
+
+    const maxBudgetInCrores = Number(
+      criteria.maxBudgetInCrores || 0
     );
 
-    let finalOutput;
+    if (!city) {
+      return res.status(400).json({
+        message:
+          "Please specify a city, for example: 4 bedroom house in Karachi.",
+        properties: [],
+      });
+    }
+
+    // Normalize flat → apartment
+    if (propertyType === "flat") {
+      propertyType = "apartment";
+    }
+
+    console.log("[AI Search] Final search criteria:", {
+      city,
+      propertyType,
+      bedrooms,
+      maxBudgetInCrores,
+    });
+
+    /* =====================================================
+       STEP 3: SCRAPE ZAMEEN
+    ===================================================== */
+
+    console.log("[AI Search] Starting property scraper...");
+
+    let scrapedProperties = [];
+
     try {
-      finalOutput = JSON.parse(normalizationResponse.text);
-    } catch (parseErr) {
-      console.error('[Parse Error] Failed to parse Gemini response JSON');
-      return res.status(502).json({ 
-        message: 'AI formatting failed. Returning raw scraper data as fallback.',
-        properties: validData 
+      scrapedProperties = await scrapeListings(
+        city,
+        propertyType
+      );
+
+      console.log(
+        `[AI Search] Scraper returned ${scrapedProperties.length} listings.`
+      );
+    } catch (scraperError) {
+      console.error(
+        "[AI Search] Scraper error:",
+        scraperError?.message || scraperError
+      );
+
+      return res.status(500).json({
+        message: "Unable to fetch property listings.",
+        properties: [],
+        fallbackMode: usedFallback,
       });
     }
 
-    if (!finalOutput.properties || !Array.isArray(finalOutput.properties)) {
-      return res.status(502).json({ 
-        message: 'Invalid response structure from AI model.',
-        properties: validData 
+    /* =====================================================
+       STEP 4: NORMALIZE RESULTS
+    ===================================================== */
+
+    let properties = scrapedProperties
+      .map((property, index) =>
+        normalizeProperty(property, index)
+      )
+      .filter(Boolean);
+
+    console.log(
+      `[AI Search] Normalized ${properties.length} properties.`
+    );
+
+    /* =====================================================
+       STEP 5: FILTER BY PROPERTY TYPE
+    ===================================================== */
+
+    if (propertyType) {
+      const typeFiltered = properties.filter((property) => {
+        const typeText = String(
+          property.type || property.title || ""
+        ).toLowerCase();
+
+        if (propertyType === "house") {
+          return (
+            typeText.includes("house") ||
+            typeText.includes("villa") ||
+            typeText.includes("home")
+          );
+        }
+
+        if (propertyType === "apartment") {
+          return (
+            typeText.includes("apartment") ||
+            typeText.includes("flat")
+          );
+        }
+
+        if (propertyType === "plot") {
+          return typeText.includes("plot");
+        }
+
+        if (propertyType === "commercial") {
+          return (
+            typeText.includes("commercial") ||
+            typeText.includes("office") ||
+            typeText.includes("shop")
+          );
+        }
+
+        return true;
       });
+
+      // Only replace results if filtering found something
+      if (typeFiltered.length > 0) {
+        properties = typeFiltered;
+      }
     }
 
-    return res.status(200).json(finalOutput);
+  /* =====================================================
+   STEP 6: FILTER BY BEDROOMS
+=====================================================*/
 
+if (bedrooms > 0) {
+  properties = properties.filter((property) => {
+    const propertyBedrooms = Number(
+      property.bedrooms || property.beds || 0
+    );
+
+    return propertyBedrooms >= bedrooms;
+  });
+
+  console.log(
+    `[AI Search] Bedroom filter (${bedrooms}+): ${properties.length} listings.`
+  );
+}
+    /* =====================================================
+       STEP 7: FILTER BY BUDGET
+    ===================================================== */
+
+    if (maxBudgetInCrores > 0) {
+      const budgetFiltered = properties.filter((property) => {
+        const priceInCrores = extractPriceInCrores(
+          property.price
+        );
+
+        if (priceInCrores === 0) {
+          return true;
+        }
+
+        return priceInCrores <= maxBudgetInCrores;
+      });
+
+      if (budgetFiltered.length > 0) {
+        properties = budgetFiltered;
+      }
+    }
+
+    /* =====================================================
+       STEP 8: UNIQUE IDS
+    ===================================================== */
+
+    properties = makeUniqueIds(properties);
+
+    /* =====================================================
+       STEP 9: LIMIT RESULTS
+    ===================================================== */
+
+    properties = properties.slice(0, 10);
+
+    console.log(
+      `[AI Search] Returning ${properties.length} properties.`
+    );
+
+    if (properties.length > 0) {
+      console.log(
+        "[AI Search] First property:",
+        JSON.stringify(properties[0], null, 2)
+      );
+    }
+
+    /* =====================================================
+       STEP 10: RESPONSE
+    ===================================================== */
+
+    return res.status(200).json({
+      success: true,
+      message: usedFallback
+        ? "Properties found using fallback search."
+        : "AI property search completed successfully.",
+      fallbackMode: usedFallback,
+      criteria: {
+        city,
+        propertyType,
+        bedrooms,
+        maxBudgetInCrores,
+      },
+      count: properties.length,
+      properties,
+    });
   } catch (error) {
-    console.error('[AI Search Error]:', error.message);
-    return res.status(500).json({ 
-      message: 'Search processing failed.', 
-      error: error.message 
+    console.error(
+      "[AI Search] Unexpected error:",
+      error?.message || error
+    );
+
+    return res.status(500).json({
+      success: false,
+      message: "Something went wrong while searching for properties.",
+      properties: [],
     });
   }
 };
 
-// Controller 2: Interactive Property Assistant Chat
+/* =========================================================
+   PROPERTY CHAT
+========================================================= */
+
 export const propertyChat = async (req, res) => {
   try {
-    const { message, propertyContext } = req.body;
+    const message = req.body?.message || "";
 
-    if (!message || message.trim() === '') {
-      return res.status(400).json({ message: 'Message cannot be empty' });
+    if (!message.trim()) {
+      return res.status(400).json({
+        message: "Please provide a message.",
+      });
     }
 
-    if (!process.env.GEMINI_API_KEY) {
-      return res.status(500).json({ message: 'GEMINI_API_KEY missing in .env file' });
-    }
-
-    const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-
-    let promptContent = message;
-    if (propertyContext && typeof propertyContext === 'object') {
-      const contextStr = JSON.stringify(propertyContext);
-      if (contextStr.length > 2500) {
-        return res.status(400).json({ message: 'Property context payload is too large' });
-      }
-      promptContent = `You are an expert real estate consultant. Context of the property being discussed: ${contextStr}. User question: ${message}`;
+    if (!ai) {
+      return res.status(503).json({
+        message:
+          "Gemini API is not configured. Please add GEMINI_API_KEY.",
+      });
     }
 
     const response = await withTimeout(
       ai.models.generateContent({
-        model: 'gemini-3.6-flash',
-        contents: promptContent,
+        model: GEMINI_MODEL,
+        contents: `
+You are a helpful real estate assistant.
+
+Answer the user's question clearly and briefly.
+
+User:
+${message}
+        `,
       }),
-      10000
+      GEMINI_TIMEOUT
     );
 
-    if (!response || !response.text) {
-      return res.status(500).json({ message: 'No text response returned from AI model.' });
-    }
+    const text =
+      response?.text ||
+      response?.response?.text ||
+      "I couldn't generate a response.";
 
-    return res.status(200).json({ reply: response.text });
+    return res.status(200).json({
+      success: true,
+      message: text,
+    });
   } catch (error) {
-    console.error('[Property Chat Error]:', error.message);
+    console.error(
+      "[Property Chat Error]:",
+      error?.message || error
+    );
+
     return res.status(500).json({
-      message: 'Failed to generate chat response.',
-      error: error.message,
+      success: false,
+      message: handleGeminiError(error),
     });
   }
 };

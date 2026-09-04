@@ -1,113 +1,125 @@
-import User from '../models/User.js';
 import jwt from 'jsonwebtoken';
-import bcrypt from 'bcryptjs';
+import User from '../models/User.js';
 
 const generateToken = (id) => {
-  if (!process.env.JWT_SECRET) {
-    console.warn('[Security Warning]: JWT_SECRET is not set in .env file. Falling back to default.');
+  const secret = process.env.JWT_SECRET;
+
+  if (!secret) {
+    const error = new Error(
+      'JWT_SECRET is not defined in environment variables. Please add JWT_SECRET to your .env file'
+    );
+    error.statusCode = 500;
+    throw error;
   }
-  return jwt.sign({ id }, process.env.JWT_SECRET || 'secret123', {
+
+  return jwt.sign({ id }, secret, {
     expiresIn: '30d',
   });
 };
 
-export const registerUser = async (req, res) => {
+// Exported as 'login' to match authRoutes.js import
+export const login = async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Please enter email and password.' });
+    }
+
+    const user = await User.findOne({ email });
+    if (!user) {
+      return res.status(400).json({ error: 'Invalid email or password.' });
+    }
+
+    const isMatch = await user.matchPassword(password);
+    if (!isMatch) {
+      return res.status(400).json({ error: 'Invalid email or password.' });
+    }
+
+    const token = generateToken(user._id);
+
+    return res.status(200).json({
+      _id: user._id,
+      id: user._id,
+      name: user.name,
+      email: user.email,
+      savedProperties: user.savedProperties || [],
+      token,
+    });
+  } catch (error) {
+    console.error('Login error:', error);
+    const statusCode = error.statusCode || 500;
+    return res.status(statusCode).json({ error: 'Login failed.', details: error.message });
+  }
+};
+
+// Exported as 'register' to match authRoutes.js import
+export const register = async (req, res) => {
   try {
     const { name, email, password } = req.body;
 
     if (!name || !email || !password) {
-      return res.status(400).json({ message: 'Please provide all required fields' });
+      return res.status(400).json({ error: 'Please provide name, email, and password.' });
     }
 
-    const userExists = await User.findOne({ email });
-    if (userExists) {
-      return res.status(400).json({ message: 'User already exists' });
+    const existingUser = await User.findOne({ email });
+    if (existingUser) {
+      return res.status(400).json({ error: 'User already exists with this email.' });
     }
 
-    const salt = await bcrypt.genSalt(10);
-    const hashedPassword = await bcrypt.hash(password, salt);
+    const user = await User.create({ name, email, password });
+    const token = generateToken(user._id);
 
-    const user = await User.create({
-      name,
-      email,
-      password: hashedPassword,
+    return res.status(201).json({
+      _id: user._id,
+      id: user._id,
+      name: user.name,
+      email: user.email,
+      savedProperties: [],
+      token,
     });
-
-    if (user) {
-      return res.status(201).json({
-        _id: user.id,
-        name: user.name,
-        email: user.email,
-        token: generateToken(user._id),
-      });
-    } else {
-      return res.status(400).json({ message: 'Invalid user data' });
-    }
   } catch (error) {
-    return res.status(500).json({ message: 'Server error during registration', error: error.message });
-  }
-};
-
-export const loginUser = async (req, res) => {
-  try {
-    const { email, password } = req.body;
-
-    const user = await User.findOne({ email });
-    if (user && (await bcrypt.compare(password, user.password))) {
-      return res.status(200).json({
-        _id: user.id,
-        name: user.name,
-        email: user.email,
-        savedProperties: user.savedProperties,
-        token: generateToken(user._id),
-      });
-    } else {
-      return res.status(401).json({ message: 'Invalid email or password' });
-    }
-  } catch (error) {
-    return res.status(500).json({ message: 'Server error during login', error: error.message });
+    console.error('Registration error:', error);
+    const statusCode = error.statusCode || 500;
+    return res.status(statusCode).json({ error: 'Registration failed.', details: error.message });
   }
 };
 
 export const getProfile = async (req, res) => {
   try {
-    const userId = req.user?.id || req.params.userId;
+    const userId = req.params.userId || req.user?.id;
 
     if (!userId) {
-      return res.status(400).json({ message: 'User ID is required' });
+      return res.status(400).json({ error: 'User ID is required' });
     }
 
     const user = await User.findById(userId).select('-password');
-    if (!user) {
-      return res.status(404).json({ message: 'User not found' });
-    }
+
+    if (!user) return res.status(404).json({ error: 'User not found' });
 
     return res.status(200).json(user);
   } catch (error) {
-    return res.status(500).json({ message: 'Failed to fetch profile', error: error.message });
+    return res.status(500).json({ error: 'Failed to fetch user profile', details: error.message });
   }
 };
 
 export const toggleSaveProperty = async (req, res) => {
   try {
     const { propertyId } = req.body;
+
     const userId = req.user?.id;
 
     if (!userId) {
-      return res.status(401).json({ message: 'Authentication required to save properties' });
-    }
-
-    if (!propertyId) {
-      return res.status(400).json({ message: 'Property ID is required' });
+      return res.status(401).json({ error: 'You must be logged in to save properties' });
     }
 
     const user = await User.findById(userId);
-    if (!user) {
-      return res.status(404).json({ message: 'User not found' });
-    }
+    if (!user) return res.status(404).json({ error: 'User not found' });
 
     const propertyStringId = String(propertyId);
-    const index = user.savedProperties.findIndex((id) => String(id) === propertyStringId);
+    const index = user.savedProperties.findIndex(
+      (id) => String(id) === propertyStringId
+    );
 
     if (index > -1) {
       user.savedProperties.splice(index, 1);
@@ -121,6 +133,6 @@ export const toggleSaveProperty = async (req, res) => {
       savedProperties: user.savedProperties,
     });
   } catch (error) {
-    return res.status(500).json({ message: 'Failed to update saved properties', error: error.message });
+    return res.status(500).json({ error: 'Failed to update saved properties', details: error.message });
   }
 };

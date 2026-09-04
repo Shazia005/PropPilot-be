@@ -1,121 +1,321 @@
-import puppeteer from 'puppeteer';
+import puppeteer from "puppeteer";
 
-// Browser singleton instance
-let browserInstance = null;
-
-// Concurrency rate limiting
-let activeScrapers = 0;
-const MAX_CONCURRENT_SCRAPERS = 2;
-
-async function getBrowser() {
-  if (!browserInstance || !browserInstance.isConnected()) {
-    browserInstance = await puppeteer.launch({
-      headless: true,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
-        '--disable-gpu',
-        '--single-process'
-      ],
-    });
-  }
-  return browserInstance;
-}
-
-const formatCity = (city) => {
-  if (!city) return 'Lahore';
-  return city
-    .trim()
-    .toLowerCase()
-    .split(/\s+/)
-    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
-    .join('_');
+const CITY_IDS = {
+  islamabad: "3",
+  lahore: "1",
+  karachi: "2",
+  rawalpindi: "41",
+  peshawar: "17",
+  faisalabad: "16",
+  multan: "15",
+  quetta: "40",
 };
 
-const formatPropertyType = (type = '') => {
-  const lower = type.toLowerCase();
-  if (lower.includes('flat') || lower.includes('apartment')) return 'Flats_Apartments';
-  if (lower.includes('plot') || lower.includes('land')) return 'Plots';
-  if (lower.includes('commercial') || lower.includes('shop') || lower.includes('office')) return 'Commercial';
-  return 'Houses_Property';
-};
+const formatPropertyType = (type) => {
+  const value = String(type || "house").toLowerCase();
 
-export async function scrapeListings(city = 'Lahore', propertyType = 'House') {
-  // Queue requests if max concurrency is reached
-  while (activeScrapers >= MAX_CONCURRENT_SCRAPERS) {
-    await new Promise((resolve) => setTimeout(resolve, 800));
+  if (value.includes("apartment") || value.includes("flat")) {
+    return "Flats_Apartments";
   }
 
-  activeScrapers++;
-  let page;
+  if (value.includes("plot")) {
+    return "Plots";
+  }
+
+  if (value.includes("commercial")) {
+    return "Commercial_Properties";
+  }
+
+  return "Houses_Property";
+};
+
+export const scrapeListings = async (
+  city = "islamabad",
+  type = "house"
+) => {
+  let browser;
 
   try {
-    const browser = await getBrowser();
-    page = await browser.newPage();
+    const cityKey = String(city).toLowerCase().trim();
+    const cityId = CITY_IDS[cityKey];
+
+    if (!cityId) {
+      console.log("[Scraper] Unknown city:", city);
+      return [];
+    }
+
+    const propertyType = formatPropertyType(type);
+
+    const cityName =
+      cityKey.charAt(0).toUpperCase() + cityKey.slice(1);
+
+    const url =
+      "https://www.zameen.com/" +
+      propertyType +
+      "/" +
+      cityName +
+      "-" +
+      cityId +
+      "-1.html";
+
+    console.log("[Scraper] Accessing:", url);
+
+    browser = await puppeteer.launch({
+      headless: true,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+      ],
+    });
+
+    const page = await browser.newPage();
 
     await page.setRequestInterception(true);
-    page.on('request', (req) => {
-      if (['image', 'media', 'font', 'stylesheet', 'other'].includes(req.resourceType())) {
-        req.abort();
+
+    page.on("request", (request) => {
+      const resourceType = request.resourceType();
+
+      if (
+        resourceType === "media" ||
+        resourceType === "font" ||
+        resourceType === "stylesheet"
+      ) {
+        request.abort();
       } else {
-        req.continue();
+        request.continue();
       }
     });
 
-    await page.setUserAgent(
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, Gecko) Chrome/122.0.0.0 Safari/537.36'
-    );
-
-    const formattedCity = formatCity(city);
-    const formattedType = formatPropertyType(propertyType);
-    const targetUrl = `https://www.zameen.com/${formattedType}/${formattedCity}-3-1.html`;
-
-    console.log(`[Scraper] Accessing: ${targetUrl}`);
-    await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
-
-    // Wait for listing articles safely
-    await page.waitForSelector('li[role="article"], article, div[aria-label="Listing"]', { timeout: 4000 }).catch(() => null);
-
-    const rawListings = await page.evaluate(() => {
-      const items = Array.from(document.querySelectorAll('li[role="article"], article, div[aria-label="Listing"]'));
-
-      return items.slice(0, 10).map((el, idx) => {
-        try {
-          const titleEl = el.querySelector('h2, [aria-label="Title"], a[title]');
-          const priceEl = el.querySelector('[aria-label="Price"], span[title*="PKR"], span[class*="f343d9ac"]');
-          const locationEl = el.querySelector('[aria-label="Location"], div[aria-label="Listing location"]');
-          const linkEl = el.querySelector('a');
-
-          const title = titleEl ? titleEl.textContent.trim() : '';
-          const price = priceEl ? priceEl.textContent.trim() : '';
-          const location = locationEl ? locationEl.textContent.trim() : '';
-          const link = linkEl ? linkEl.href : '';
-
-          return {
-            rawId: link ? link.split('/').pop().replace('.html', '') : `zam-${idx + 1}`,
-            rawTitle: title,
-            rawPrice: price,
-            rawLocation: location,
-            rawLink: link
-          };
-        } catch (e) {
-          return null;
-        }
-      }).filter((item) => item && (item.rawTitle || item.rawPrice));
+    await page.goto(url, {
+      waitUntil: "domcontentloaded",
+      timeout: 60000,
     });
 
-    await page.close();
-    return rawListings || [];
+    await new Promise((resolve) => setTimeout(resolve, 3000));
 
-  } catch (error) {
-    if (page) {
-      try { await page.close(); } catch (e) {}
+    const listings = await page.evaluate(() => {
+      const elements = Array.from(
+        document.querySelectorAll(
+          '[data-testid="listing-card"], article, [class*="listing"]'
+        )
+      );
+
+      const results = [];
+
+      for (const element of elements) {
+        const text = element.innerText || "";
+
+        if (!text.trim()) {
+          continue;
+        }
+
+        const links = Array.from(
+          element.querySelectorAll("a")
+        );
+
+        const propertyLink = links.find((link) => {
+          const href = link.href || "";
+
+          return href.includes(
+            "zameen.com/Property/"
+          );
+        });
+
+        if (!propertyLink) {
+          continue;
+        }
+
+        const images = Array.from(
+          element.querySelectorAll("img")
+        );
+
+        const image = images.find((img) => {
+          const src =
+            img.getAttribute("src") ||
+            img.getAttribute("data-src") ||
+            img.getAttribute("data-original");
+
+          return src && src.startsWith("http");
+        });
+
+        const title =
+          element.querySelector("h2")?.innerText ||
+          element.querySelector("h3")?.innerText ||
+          propertyLink.innerText ||
+          "Property";
+
+        /*
+         * PRICE
+         *
+         * Look specifically after PKR so that
+         * numbers such as "20" from badges are
+         * not mistaken for the price.
+         */
+
+        const priceMatch = text.match(
+          /PKR\s*([\d,.]+)\s*(Crore|Lakh|Million|Thousand)?/i
+        );
+
+        let extractedPrice = "Price not available";
+
+        if (priceMatch) {
+          extractedPrice =
+            priceMatch[1] +
+            (priceMatch[2]
+              ? " " + priceMatch[2]
+              : "");
+        }
+
+        /*
+         * BEDROOMS
+         *
+         * First try explicit text:
+         * "4 Bedrooms", "4 Beds"
+         */
+
+        const bedroomTextMatch = text.match(
+          /(\d+)\s*(?:Beds?|Bedrooms?)/i
+        );
+
+        /*
+         * BATHROOMS
+         *
+         * First try explicit text:
+         * "4 Bathrooms", "4 Baths"
+         */
+
+        const bathroomTextMatch = text.match(
+          /(\d+)\s*(?:Baths?|Bathrooms?)/i
+        );
+
+        let extractedBedrooms = bedroomTextMatch
+          ? Number(bedroomTextMatch[1])
+          : 0;
+
+        let extractedBathrooms = bathroomTextMatch
+          ? Number(bathroomTextMatch[1])
+          : 0;
+
+        /*
+         * Zameen often displays bedrooms and
+         * bathrooms as two numbers immediately
+         * before the area.
+         *
+         * Example:
+         *
+         * 4
+         * 4
+         * 350 Sq. Yd.
+         *
+         * Therefore, use the two numbers before
+         * the area as a fallback.
+         */
+
+        const lines = text
+          .split("\n")
+          .map((line) => line.trim())
+          .filter(Boolean);
+
+        const areaIndex = lines.findIndex((line) =>
+          /Sq\.?\s*(?:Yd|Ft)|Kanal|Marla/i.test(line)
+        );
+
+        if (areaIndex >= 2) {
+          const possibleBedrooms = Number(
+            lines[areaIndex - 2]
+          );
+
+          const possibleBathrooms = Number(
+            lines[areaIndex - 1]
+          );
+
+          if (
+            extractedBedrooms === 0 &&
+            Number.isInteger(possibleBedrooms) &&
+            possibleBedrooms >= 1 &&
+            possibleBedrooms <= 20
+          ) {
+            extractedBedrooms = possibleBedrooms;
+          }
+
+          if (
+            extractedBathrooms === 0 &&
+            Number.isInteger(possibleBathrooms) &&
+            possibleBathrooms >= 1 &&
+            possibleBathrooms <= 20
+          ) {
+            extractedBathrooms = possibleBathrooms;
+          }
+        }
+
+        /*
+         * AREA
+         */
+
+        const areaMatch = text.match(
+          /([\d,.]+)\s*(?:Sq\.?\s*(?:Yd|Ft)|Kanal|Marla)/i
+        );
+
+        results.push({
+          rawId: propertyLink.href,
+
+          rawTitle: title.trim(),
+
+          rawPrice: extractedPrice,
+
+          rawLocation: text
+            .trim()
+            .slice(0, 150),
+
+          rawLink: propertyLink.href,
+
+          rawImage: image
+            ? image.getAttribute("src") ||
+              image.getAttribute("data-src") ||
+              image.getAttribute("data-original")
+            : "",
+
+          rawBedrooms: extractedBedrooms,
+
+          rawBathrooms: extractedBathrooms,
+
+          rawArea: areaMatch
+            ? areaMatch[0].trim()
+            : "",
+        });
+      }
+
+      return results;
+    });
+
+    console.log(
+      "[Scraper] Extracted",
+      listings.length,
+      "listings"
+    );
+
+    if (listings.length > 0) {
+      console.log(
+        "[Scraper] First listing:",
+        JSON.stringify(
+          listings[0],
+          null,
+          2
+        )
+      );
     }
-    console.error('[Scraper Error]:', error.message);
+
+    return listings;
+  } catch (error) {
+    console.error(
+      "[Scraper] Error:",
+      error.message
+    );
+
     return [];
   } finally {
-    activeScrapers--;
+    if (browser) {
+      await browser.close();
+    }
   }
-}
+};
