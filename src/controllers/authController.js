@@ -103,36 +103,182 @@ export const getProfile = async (req, res) => {
   }
 };
 
+
 export const toggleSaveProperty = async (req, res) => {
   try {
-    const { propertyId } = req.body;
-
     const userId = req.user?.id;
 
+    const { property } = req.body;
+
     if (!userId) {
-      return res.status(401).json({ error: 'You must be logged in to save properties' });
+      return res.status(401).json({
+        error: 'You must be logged in to save properties',
+      });
+    }
+
+    if (!property) {
+      return res.status(400).json({
+        error: 'Property data is required',
+      });
+    }
+
+    const propertyId = String(
+      property.id ||
+      property._id ||
+      property.sourceUrl ||
+      ''
+    );
+
+    if (!propertyId) {
+      return res.status(400).json({
+        error: 'Property ID is required',
+      });
     }
 
     const user = await User.findById(userId);
-    if (!user) return res.status(404).json({ error: 'User not found' });
 
-    const propertyStringId = String(propertyId);
+    if (!user) {
+      return res.status(404).json({
+        error: 'User not found',
+      });
+    }
+
     const index = user.savedProperties.findIndex(
-      (id) => String(id) === propertyStringId
+      (savedProperty) =>
+        String(savedProperty.id) === propertyId
     );
 
     if (index > -1) {
       user.savedProperties.splice(index, 1);
+
+      console.log(
+        '[Favorites] Property removed:',
+        propertyId
+      );
     } else {
-      user.savedProperties.push(propertyStringId);
+      user.savedProperties.push({
+        id: propertyId,
+
+        title:
+          property.title ||
+          property.rawTitle ||
+          'Property Listing',
+
+        location:
+          property.location ||
+          property.city ||
+          'Location unavailable',
+
+        city:
+          property.city ||
+          '',
+
+        type:
+          property.type ||
+          property.propertyType ||
+          'House',
+
+        price:
+          property.price ||
+          property.rawPrice ||
+          'Price unavailable',
+
+        bedrooms: Number(
+          property.bedrooms ??
+          property.beds ??
+          0
+        ),
+
+        bathrooms: Number(
+          property.bathrooms ??
+          property.baths ??
+          0
+        ),
+
+        area:
+          property.area ||
+          property.areaSqFt ||
+          property.rawArea ||
+          'N/A',
+
+        image:
+          property.image ||
+          property.imageUrl ||
+          property.rawImage ||
+          '',
+
+        imageUrl:
+          property.imageUrl ||
+          property.image ||
+          property.rawImage ||
+          '',
+
+        sourceUrl:
+          property.sourceUrl ||
+          property.rawLink ||
+          property.link ||
+          '',
+      });
+
+      console.log(
+        '[Favorites] Property added:',
+        propertyId
+      );
     }
 
     await user.save();
+
     return res.status(200).json({
       success: true,
       savedProperties: user.savedProperties,
     });
   } catch (error) {
-    return res.status(500).json({ error: 'Failed to update saved properties', details: error.message });
+    console.error(
+      '[Favorites] Error:',
+      error
+    );
+
+    return res.status(500).json({
+      error: 'Failed to update saved properties',
+      details: error.message,
+    });
+  }
+};
+
+
+
+export const getSavedProperties = async (req, res) => {
+  try {
+    const userId = req.user?.id;
+
+    if (!userId) {
+      return res.status(401).json({
+        error: 'You must be logged in',
+      });
+    }
+
+    const user = await User.findById(userId)
+      .select('savedProperties');
+
+    if (!user) {
+      return res.status(404).json({
+        error: 'User not found',
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      savedProperties: user.savedProperties || [],
+    });
+  } catch (error) {
+    console.error(
+      'Get saved properties error:',
+      error
+    );
+
+    return res.status(500).json({
+      error: 'Failed to fetch saved properties',
+      details: error.message,
+    });
   }
 };
