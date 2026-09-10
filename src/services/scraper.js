@@ -26,9 +26,30 @@ const MAX_PAGES = 3;
 
 let browserInstance = null;
 
+const closeBrowser = async () => {
+  if (browserInstance) {
+    try {
+      await browserInstance.close();
+    } catch {
+      // Ignore close errors
+    }
+    browserInstance = null;
+  }
+};
+
 const getBrowser = async () => {
   if (browserInstance) {
-    return browserInstance;
+    const connected =
+      browserInstance.connected !== false;
+
+    if (connected) {
+      return browserInstance;
+    }
+
+    console.log(
+      '[Scraper] Browser disconnected, recreating...'
+    );
+    await closeBrowser();
   }
 
   browserInstance = await puppeteer.launch({
@@ -205,21 +226,84 @@ const extractListingsFromPage = async (page) => {
 
         /*
          * PRICE
+         *
+         * Scan individual lines to find the full price
+         * string including unit (e.g. "PKR 3.6 Crore",
+         * "49 Lakh", "3,60,00,000"). The full-text regex
+         * often misses the unit when it is on a separate
+         * line from the number.
          */
-        const priceMatch =
-          text.match(
-            /PKR\s*([\d,.]+)\s*(Crore|Crores|Lakh|Lakhs|Million|Thousand)?/i
-          );
-
         let price = '';
 
-        if (priceMatch) {
-          price =
-            `${priceMatch[1]}${
-              priceMatch[2]
-                ? ` ${priceMatch[2]}`
-                : ''
-            }`;
+        const priceUnitPattern =
+          /(?:PKR\s*)?([\d,.]+)\s*(Crore|Crores|Cr|Lakh|Lakhs|Million|Millions|Thousand|Thousands)?/i;
+
+        const unitOnlyPattern =
+          /\b(Crore|Crores|Cr|Lakh|Lakhs|Million|Millions|Thousand|Thousands)\b/i;
+
+        for (let i = 0; i < lines.length; i++) {
+          const priceLineMatch =
+            lines[i].match(priceUnitPattern);
+
+          if (
+            priceLineMatch &&
+            /PKR|Crore|Crores|Cr|Lakh|Lakhs|Million|Thousand|\d{2,}/i.test(
+              lines[i]
+            )
+          ) {
+            const numPart = priceLineMatch[1];
+
+            if (priceLineMatch[2]) {
+              price = `${numPart} ${priceLineMatch[2]}`;
+            } else {
+              let foundUnit = '';
+
+              for (let j = i + 1; j < Math.min(i + 10, lines.length); j++) {
+                const unitMatch = lines[j].match(unitOnlyPattern);
+                if (unitMatch) {
+                  foundUnit = unitMatch[1];
+                  break;
+                }
+              }
+
+              price = foundUnit
+                ? `${numPart} ${foundUnit}`
+                : numPart;
+            }
+
+            break;
+          }
+        }
+
+        /*
+         * Fallback: try the full text if line scanning
+         * did not find a price with a unit.
+         */
+        if (!price) {
+          const fullTextMatch =
+            text.match(
+              /(?:PKR\s*)?([\d,.]+)\s*(Crore|Crores|Cr|Lakh|Lakhs|Million|Millions|Thousand|Thousands)/i
+            );
+
+          if (fullTextMatch) {
+            price =
+              `${fullTextMatch[1]} ${fullTextMatch[2]}`;
+          }
+        }
+
+        if (price && !unitOnlyPattern.test(price)) {
+          const numOnlyMatch = price.match(/([\d,.]+)/);
+          if (numOnlyMatch) {
+            const numStr = numOnlyMatch[1];
+            const numIdx = text.indexOf(numStr);
+            if (numIdx !== -1) {
+              const afterNum = text.substring(numIdx, numIdx + 80);
+              const lateUnitMatch = afterNum.match(unitOnlyPattern);
+              if (lateUnitMatch) {
+                price = `${numStr} ${lateUnitMatch[1]}`;
+              }
+            }
+          }
         }
 
         /*
@@ -250,20 +334,23 @@ const extractListingsFromPage = async (page) => {
          * Matches: 2 Bath, 2 Baths, 2 Bathroom, 2 Bathrooms,
          * 2 Bath Room, 2 Bath Rooms, 2 Washroom, 2 Washrooms,
          * 2 Wash Room, 2 Wash Rooms, 2 Toilet, 2 Toilets,
-         * 2 Ensuite, 2 Ensuites, 2 Powder Room
+         * 2 Ensuite, 2 Ensuites, 2 Powder Room,
+         * 4+1 Bath, 4 / 2 (bed/bath format)
          */
         let bathrooms = 0;
 
-        const bathroomMatch =
-          text.match(
-            /(\d+)\s*(?:bath(?:\s*room)?s?|wash\s*rooms?|toilets?|ensuites?|powder\s*rooms?|half\s*baths?|powder\s*baths?)\b/i
-          );
+        const bathroomPatterns = [
+          /(\d+)\s*(?:\+\d+)?\s*(?:bath(?:\s*room)?s?|wash\s*rooms?|toilets?|ensuites?|powder\s*rooms?|half\s*baths?|powder\s*baths?)\b/i,
+          /bath(?:room)?s?\s*[:\-\/]\s*(\d+)/i,
+          /(\d+)\s*baths?\b/i,
+        ];
 
-        if (bathroomMatch) {
-          bathrooms =
-            Number(
-              bathroomMatch[1]
-            );
+        for (const pattern of bathroomPatterns) {
+          const match = text.match(pattern);
+          if (match) {
+            bathrooms = Number(match[1]);
+            break;
+          }
         }
 
         /*
@@ -443,6 +530,43 @@ const extractListingsFromPage = async (page) => {
          */
         let location = '';
 
+        /*
+         * Non-location words that should never be
+         * treated as a property location.
+         */
+        const rejectWords = [
+          'verified',
+          'hot',
+          'featured',
+          'new',
+          'titanium',
+          'premium',
+          'agent',
+          'broker',
+          'proprietor',
+          'contact',
+          'available',
+          'rent',
+          'sale',
+          'sell',
+          'buy',
+          'invest',
+          'deal',
+          'token',
+          'advance',
+          'negotiable',
+          'demand',
+          'urgent',
+          'offer',
+        ];
+
+        const isRejectedLocation = (value) => {
+          if (!value) return true;
+          const lower = value.toLowerCase().trim();
+          if (lower.length < 3) return true;
+          return rejectWords.includes(lower);
+        };
+
         const locationSelectors = [
           '[data-testid*="location"]',
           '[class*="location"]',
@@ -464,7 +588,8 @@ const extractListingsFromPage = async (page) => {
           if (
             value &&
             value.length > 2 &&
-            !/PKR/i.test(value)
+            !/PKR/i.test(value) &&
+            !isRejectedLocation(value)
           ) {
             location =
               value;
@@ -563,6 +688,10 @@ const extractListingsFromPage = async (page) => {
               continue;
             }
 
+            if (isRejectedLocation(line)) {
+              continue;
+            }
+
             if (
               line.length >= 3 &&
               line.length <= 100
@@ -611,251 +740,328 @@ const extractListingsFromPage = async (page) => {
   });
 };
 
+const SCRAPE_RETRIES = 3;
+
 export const scrapeListings = async (
   city,
-  propertyType = 'house'
+  propertyType = 'house',
+  criteria = {}
 ) => {
-  let page;
+  const normalizedCity =
+    String(city || '')
+      .toLowerCase()
+      .trim();
 
-  try {
-    const normalizedCity =
-      String(city || '')
-        .toLowerCase()
-        .trim();
+  const normalizedType =
+    String(
+      propertyType || 'house'
+    )
+      .toLowerCase()
+      .trim();
 
-    const normalizedType =
-      String(
-        propertyType || 'house'
-      )
-        .toLowerCase()
-        .trim();
+  const cityId =
+    CITY_IDS[
+      normalizedCity
+    ];
 
-    const cityId =
-      CITY_IDS[
-        normalizedCity
-      ];
-
-    if (!cityId) {
-      throw new Error(
-        `Unsupported city: ${normalizedCity}`
-      );
-    }
-
-    const propertyPath =
-      PROPERTY_TYPE_PATHS[
-        normalizedType
-      ] ||
-      'Houses_Property';
-
-    const browser =
-      await getBrowser();
-
-    page =
-      await browser.newPage();
-
-    await page.setViewport({
-      width: 1366,
-      height: 768,
-    });
-
-    await page.setRequestInterception(
-      true
+  if (!cityId) {
+    console.error(
+      `[Scraper] Unsupported city: ${normalizedCity}`
     );
+    return [];
+  }
 
-    page.on(
-      'request',
-      (request) => {
-        const resourceType =
-          request.resourceType();
+  for (
+    let attempt = 1;
+    attempt <= SCRAPE_RETRIES;
+    attempt++
+  ) {
+    let page;
+
+    try {
+      const propertyPath =
+        PROPERTY_TYPE_PATHS[
+          normalizedType
+        ] ||
+        'Houses_Property';
+
+      const browser =
+        await getBrowser();
+
+      page =
+        await browser.newPage();
+
+      await page.setViewport({
+        width: 1366,
+        height: 768,
+      });
+
+      await page.setRequestInterception(
+        true
+      );
+
+      page.on(
+        'request',
+        (request) => {
+          const resourceType =
+            request.resourceType();
+
+          if (
+            resourceType ===
+              'image' ||
+            resourceType ===
+              'media' ||
+            resourceType ===
+              'font' ||
+            resourceType ===
+              'stylesheet'
+          ) {
+            request.abort();
+          } else {
+            request.continue();
+          }
+        }
+      );
+
+      await page.setUserAgent(
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/142.0.0.0 Safari/537.36'
+      );
+
+      const allListings = [];
+
+      for (
+        let pageNumber = 1;
+        pageNumber <= MAX_PAGES;
+        pageNumber++
+      ) {
+        const cityName =
+          normalizedCity
+            .charAt(0)
+            .toUpperCase() +
+          normalizedCity.slice(1);
+
+        let url =
+          `https://www.zameen.com/` +
+          `${propertyPath}/` +
+          `${cityName}-${cityId}-${pageNumber}.html`;
+
+        const queryParams = [];
+
+        if (criteria.bedrooms > 0) {
+          queryParams.push(
+            `bedrooms_min=${criteria.bedrooms}`
+          );
+          queryParams.push(
+            `bedrooms_max=${criteria.bedrooms}`
+          );
+        }
 
         if (
-          resourceType ===
-            'image' ||
-          resourceType ===
-            'media' ||
-          resourceType ===
-            'font' ||
-          resourceType ===
-            'stylesheet'
+          criteria.minBudgetInCrores > 0
         ) {
-          request.abort();
-        } else {
-          request.continue();
+          queryParams.push(
+            `price_min=${Math.round(
+              criteria.minBudgetInCrores *
+                10000000
+            )}`
+          );
+        }
+
+        if (
+          criteria.maxBudgetInCrores > 0
+        ) {
+          queryParams.push(
+            `price_max=${Math.round(
+              criteria.maxBudgetInCrores *
+                10000000
+            )}`
+          );
+        }
+
+        if (queryParams.length > 0) {
+          url += `?${queryParams.join(
+            '&'
+          )}`;
+        }
+
+        console.log(
+          `[Scraper] Accessing page ${pageNumber}: ${url}`
+        );
+
+        try {
+          await page.goto(
+            url,
+            {
+              waitUntil:
+                'domcontentloaded',
+              timeout: 30000,
+            }
+          );
+
+          await new Promise(
+            (resolve) =>
+              setTimeout(
+                resolve,
+                1500
+              )
+          );
+
+          const listings =
+            await extractListingsFromPage(
+              page
+            );
+
+          console.log(
+            `[Scraper] Page ${pageNumber}: extracted ${listings.length} listings`
+          );
+
+          const listingsWithTag = listings.map(
+            (listing) => ({
+              ...listing,
+              rawCity:
+                cityName,
+              rawPropertyType:
+                normalizedType,
+            })
+          );
+
+          allListings.push(
+            ...listingsWithTag
+          );
+        } catch (error) {
+          console.error(
+            `[Scraper] Page ${pageNumber} failed:`,
+            error.message
+          );
         }
       }
-    );
 
-    await page.setUserAgent(
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/142.0.0.0 Safari/537.36'
-    );
+      /*
+       * Clean URLs and images.
+       */
+      const cleanedListings =
+        allListings.map(
+          (listing) => {
+            const cleanedLink =
+              cleanUrl(
+                listing.rawLink
+              );
 
-    const allListings = [];
+            return {
+              ...listing,
 
-    for (
-      let pageNumber = 1;
-      pageNumber <= MAX_PAGES;
-      pageNumber++
-    ) {
-      const cityName =
-        normalizedCity
-          .charAt(0)
-          .toUpperCase() +
-        normalizedCity.slice(1);
+              rawId:
+                cleanUrl(
+                  listing.rawId
+                ) ||
+                cleanedLink,
 
-      const url =
-        `https://www.zameen.com/` +
-        `${propertyPath}/` +
-        `${cityName}-${cityId}-${pageNumber}.html`;
+              rawLink:
+                cleanedLink,
 
-      console.log(
-        `[Scraper] Accessing page ${pageNumber}: ${url}`
-      );
-
-      try {
-        await page.goto(
-          url,
-          {
-            waitUntil:
-              'domcontentloaded',
-            timeout: 30000,
+              rawImage:
+                cleanUrl(
+                  listing.rawImage
+                ),
+            };
           }
         );
 
-        await new Promise(
-          (resolve) =>
-            setTimeout(
-              resolve,
-              1500
-            )
+      /*
+       * Remove duplicate listings.
+       */
+      const uniqueListings = [];
+
+      const seen =
+        new Set();
+
+      for (
+        const listing
+        of cleanedListings
+      ) {
+        const uniqueKey =
+          listing.rawLink ||
+          listing.rawId ||
+          `${listing.rawTitle}-${listing.rawPrice}`;
+
+        if (
+          seen.has(uniqueKey)
+        ) {
+          continue;
+        }
+
+        seen.add(
+          uniqueKey
         );
 
-        const listings =
-          await extractListingsFromPage(
-            page
-          );
-
-        console.log(
-          `[Scraper] Page ${pageNumber}: extracted ${listings.length} listings`
-        );
-
-        const listingsWithTag = listings.map(
-          (listing) => ({
-            ...listing,
-            rawCity:
-              cityName,
-            rawPropertyType:
-              normalizedType,
-          })
-        );
-
-        allListings.push(
-          ...listingsWithTag
-        );
-      } catch (error) {
-        console.error(
-          `[Scraper] Page ${pageNumber} failed:`,
-          error.message
+        uniqueListings.push(
+          listing
         );
       }
-    }
 
-    /*
-     * Clean URLs and images.
-     */
-    const cleanedListings =
-      allListings.map(
-        (listing) => {
-          const cleanedLink =
-            cleanUrl(
-              listing.rawLink
-            );
-
-          return {
-            ...listing,
-
-            rawId:
-              cleanUrl(
-                listing.rawId
-              ) ||
-              cleanedLink,
-
-            rawLink:
-              cleanedLink,
-
-            rawImage:
-              cleanUrl(
-                listing.rawImage
-              ),
-          };
-        }
+      console.log(
+        `[Scraper] Total unique listings: ${uniqueListings.length}`
       );
 
-    /*
-     * Remove duplicate listings.
-     */
-    const uniqueListings = [];
+      if (
+        uniqueListings.length > 0
+      ) {
+        console.log(
+          '[Scraper] First listing:',
+          JSON.stringify(
+            uniqueListings[0],
+            null,
+            2
+          )
+        );
+      }
 
-    const seen =
-      new Set();
+      return uniqueListings;
+    } catch (error) {
+      const msg = String(
+        error?.message || error
+      ).toLowerCase();
 
-    for (
-      const listing
-      of cleanedListings
-    ) {
-      const uniqueKey =
-        listing.rawLink ||
-        listing.rawId ||
-        `${listing.rawTitle}-${listing.rawPrice}`;
+      const isConnectionError =
+        msg.includes('connection closed') ||
+        msg.includes('connection reset') ||
+        msg.includes('not connected') ||
+        msg.includes('target closed') ||
+        msg.includes('session closed') ||
+        msg.includes('protocol error');
 
       if (
-        seen.has(uniqueKey)
+        isConnectionError &&
+        attempt < SCRAPE_RETRIES
       ) {
+        console.log(
+          `[Scraper] Connection error on attempt ${attempt}/${SCRAPE_RETRIES}, recreating browser...`
+        );
+        await closeBrowser();
+        await new Promise((r) =>
+          setTimeout(r, 1000 * attempt)
+        );
         continue;
       }
 
-      seen.add(
-        uniqueKey
+      console.error(
+        '[Scraper] Fatal error:',
+        error.message
       );
 
-      uniqueListings.push(
-        listing
-      );
-    }
-
-    console.log(
-      `[Scraper] Total unique listings: ${uniqueListings.length}`
-    );
-
-    if (
-      uniqueListings.length > 0
-    ) {
-      console.log(
-        '[Scraper] First listing:',
-        JSON.stringify(
-          uniqueListings[0],
-          null,
-          2
-        )
-      );
-    }
-
-    return uniqueListings;
-  } catch (error) {
-    console.error(
-      '[Scraper] Fatal error:',
-      error.message
-    );
-
-    return [];
-  } finally {
-    if (page) {
-      try {
-        await page.close();
-      } catch {
-        // Ignore page close errors
+      return [];
+    } finally {
+      if (page) {
+        try {
+          await page.close();
+        } catch {
+          // Ignore page close errors
+        }
       }
     }
   }
+
+  return [];
 };
 
 export default scrapeListings;

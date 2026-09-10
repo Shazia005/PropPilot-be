@@ -10,7 +10,8 @@ const ai = new GoogleGenAI({
 });
 
 /*
- * Convert different price formats into Crore.
+ * Convert price string into Crore value.
+ * e.g. "3.6 Crore" → 3.6, "49 Lakh" → 0.49, "36500000" → 3.65
  */
 const extractPriceInCrores = (price) => {
   if (
@@ -27,62 +28,34 @@ const extractPriceInCrores = (price) => {
     .replace(/pkr/g, '')
     .trim();
 
-  const croreMatch = text.match(
-    /(\d+(?:\.\d+)?)\s*(?:crore|crores|cr)\b/
-  );
-
-  if (croreMatch) {
-    return Number(croreMatch[1]);
-  }
-
-  const lakhMatch = text.match(
-    /(\d+(?:\.\d+)?)\s*(?:lakh|lakhs)\b/
-  );
-
-  if (lakhMatch) {
-    return Number(lakhMatch[1]) / 100;
-  }
-
-  const millionMatch = text.match(
-    /(\d+(?:\.\d+)?)\s*(?:million|m)\b/
-  );
-
-  if (millionMatch) {
-    return Number(millionMatch[1]) / 10;
-  }
-
-  const thousandMatch = text.match(
-    /(\d+(?:\.\d+)?)\s*(?:thousand|k)\b/
-  );
-
-  if (thousandMatch) {
-    return Number(thousandMatch[1]) / 10000;
-  }
-
   const numberMatch = text.match(
     /(\d+(?:\.\d+)?)/
   );
 
-  if (numberMatch) {
-    const number = Number(
-      numberMatch[1]
-    );
-
-    /*
-     * Raw PKR value.
-     *
-     * Example:
-     * 30000000 = 3 Crore
-     */
-    if (number >= 10000000) {
-      return number / 10000000;
-    }
-
-    if (number >= 100000) {
-      return number / 10000000;
-    }
-
+  if (!numberMatch) {
     return 0;
+  }
+
+  const number = Number(
+    numberMatch[1]
+  );
+
+  if (
+    text.includes('crore') ||
+    text.includes('cr')
+  ) {
+    return number;
+  }
+
+  if (
+    text.includes('lakh') ||
+    text.includes('lac')
+  ) {
+    return number / 100;
+  }
+
+  if (number >= 100000) {
+    return number / 10000000;
   }
 
   return 0;
@@ -97,6 +70,24 @@ const normalizeProperty = (property) => {
     property.rawLink ||
     property.link ||
     '';
+
+  const bedrooms = Number(
+    property.bedrooms ??
+      property.beds ??
+      property.rawBedrooms ??
+      0
+  );
+
+  let bathrooms = Number(
+    property.bathrooms ??
+      property.baths ??
+      property.rawBathrooms ??
+      0
+  );
+
+  if (bathrooms === 0 && bedrooms > 0) {
+    bathrooms = bedrooms;
+  }
 
   return {
     ...property,
@@ -121,19 +112,9 @@ const normalizeProperty = (property) => {
       property.rawPrice ||
       'Price unavailable',
 
-    bedrooms: Number(
-      property.bedrooms ??
-        property.beds ??
-        property.rawBedrooms ??
-        0
-    ),
+    bedrooms,
 
-    bathrooms: Number(
-      property.bathrooms ??
-        property.baths ??
-        property.rawBathrooms ??
-        0
-    ),
+    bathrooms,
 
     area:
       property.area ||
@@ -196,6 +177,23 @@ const isTemporaryGeminiError = (
 };
 
 /*
+ * Detect timeout errors (should be retried).
+ */
+const isTimeoutError = (
+  error
+) => {
+  const message =
+    String(error?.message || error)
+      .toLowerCase();
+
+  return (
+    message.includes('timed out') ||
+    message.includes('timeout') ||
+    message.includes('etimedout')
+  );
+};
+
+/*
  * Daily free-tier quota errors should NOT be retried
  * several times because waiting 30 seconds will not
  * restore a daily quota.
@@ -243,6 +241,7 @@ Return exactly this structure:
   "cities": [],
   "propertyType": "",
   "bedrooms": 0,
+  "bathrooms": 0,
   "minBudgetInCrores": 0,
   "maxBudgetInCrores": 0
 }
@@ -255,18 +254,21 @@ Rules:
    If only one city is mentioned, put it in a single-element array: ["islamabad"].
    If no city is mentioned, use ["islamabad"] as default.
 2. Convert "flat" or "flats" to "apartment".
-3. Extract bedroom count.
-4. Convert Pakistani budget expressions to Crore.
-5. "under 3 crore" means maxBudgetInCrores = 3.
-6. "below 5 crore" means maxBudgetInCrores = 5.
-7. "between 2 and 4 crore" means min = 2 and max = 4.
-8. "within 5-10 crore range" means min = 5 and max = 10.
-9. "within 2 to 5 crore" means min = 2 and max = 5.
-10. If no minimum budget is given, use 0.
-11. If no maximum budget is given, use 0.
-12. If bedrooms are not specified, use 0.
-13. Do not add explanations.
-14. Return JSON only.
+3. If the user says "no apartments", "don't include apartments", "exclude apartments", "not apartments", "house not apartment", or any similar negative phrasing about a property type, still set propertyType to "house" (the desired type). The fallback parser handles this with negation detection; do the same here.
+4. Extract bedroom count from keywords like "bedroom", "beds", "bed", "rooms", "sleeping rooms".
+5. Extract bathroom count from keywords like "bath", "baths", "bathroom", "bathrooms", "washroom", "washrooms", "toilet", "toilets", "ensuite", "ensuites", "half bath", "powder room".
+6. Convert Pakistani budget expressions to Crore.
+7. "under 3 crore" means maxBudgetInCrores = 3.
+8. "below 5 crore" means maxBudgetInCrores = 5.
+9. "between 2 and 4 crore" means min = 2 and max = 4.
+10. "within 5-10 crore range" means min = 5 and max = 10.
+11. "within 2 to 5 crore" means min = 2 and max = 5.
+12. If no minimum budget is given, use 0.
+13. If no maximum budget is given, use 0.
+14. If bedrooms are not specified, use 0.
+15. If bathrooms are not specified, use 0.
+16. Do not add explanations.
+17. Return JSON only.
 
 User request:
 ${userPrompt}
@@ -365,11 +367,16 @@ ${userPrompt}
       }
 
       if (
-        !isTemporaryGeminiError(error) ||
+        !isTemporaryGeminiError(error) &&
+        !isTimeoutError(error) ||
         attempt === GEMINI_RETRY_ATTEMPTS
       ) {
         break;
       }
+
+      console.log(
+        `[AI Search] Retrying in ${1500 * attempt}ms...`
+      );
 
       await new Promise(
         (resolve) =>
@@ -397,19 +404,38 @@ const extractFallbackCriteria = (
   let propertyType =
     'house';
 
+  const negativePatterns =
+    /\b(?:no|not|don'?t|dont|without|exclude|excluding|skip|except|apart\s*from|other\s*than)\b/i;
+
+  const isNegated = (word) => {
+    const idx = text.indexOf(word);
+    if (idx === -1) return false;
+    const before = text.substring(
+      Math.max(0, idx - 30),
+      idx
+    );
+    return negativePatterns.test(before);
+  };
+
   if (
-    text.includes('flat') ||
-    text.includes('apartment')
+    (text.includes('flat') ||
+      text.includes('apartment')) &&
+    !isNegated('flat') &&
+    !isNegated('apartment')
   ) {
     propertyType = 'apartment';
   } else if (
-    text.includes('plot')
+    text.includes('plot') &&
+    !isNegated('plot')
   ) {
     propertyType = 'plot';
   } else if (
-    text.includes('commercial') ||
-    text.includes('shop') ||
-    text.includes('office')
+    (text.includes('commercial') ||
+      text.includes('shop') ||
+      text.includes('office')) &&
+    !isNegated('commercial') &&
+    !isNegated('shop') &&
+    !isNegated('office')
   ) {
     propertyType = 'commercial';
   }
@@ -444,6 +470,19 @@ const extractFallbackCriteria = (
   if (bedroomMatch) {
     bedrooms = Number(
       bedroomMatch[1]
+    );
+  }
+
+  let bathrooms = 0;
+
+  const bathroomMatch =
+    text.match(
+      /(\d+)\s*(?:bath(?:\s*room)?s?|baths?|wash\s*rooms?|toilets?|ensuites?|powder\s*rooms?|half\s*baths?)\b/i
+    );
+
+  if (bathroomMatch) {
+    bathrooms = Number(
+      bathroomMatch[1]
     );
   }
 
@@ -498,6 +537,7 @@ const extractFallbackCriteria = (
     cities: citiesResult,
     propertyType,
     bedrooms,
+    bathrooms,
     minBudgetInCrores,
     maxBudgetInCrores,
   };
@@ -545,6 +585,10 @@ const normalizeCriteria = (
 
     bedrooms: Number(
       criteria?.bedrooms || 0
+    ),
+
+    bathrooms: Number(
+      criteria?.bathrooms || 0
     ),
 
     minBudgetInCrores: Number(
@@ -652,7 +696,8 @@ export const autonomousSearch =
         const cityResults =
           await scrapeListings(
             city,
-            criteria.propertyType
+            criteria.propertyType,
+            criteria
           );
 
         console.log(
@@ -725,6 +770,26 @@ export const autonomousSearch =
         [...properties];
 
       /*
+       * Bathroom filter.
+       */
+      if (criteria.bathrooms > 0) {
+        const bathroomFiltered =
+          properties.filter(
+            (property) =>
+              Number(
+                property.bathrooms || 0
+              ) >= criteria.bathrooms
+          );
+
+        console.log(
+          `[AI Search] Bathroom filter (${criteria.bathrooms}+): ${bathroomFiltered.length}`
+        );
+
+        properties =
+          bathroomFiltered;
+      }
+
+      /*
        * Budget filter.
        */
       if (
@@ -753,13 +818,14 @@ export const autonomousSearch =
 
               /*
                * If price cannot be parsed,
-               * keep the listing rather than
-               * incorrectly rejecting it.
+               * exclude the listing when a budget
+               * constraint is specified, because we
+               * cannot confirm it is within range.
                */
               if (
                 priceInCrores === 0
               ) {
-                return true;
+                return false;
               }
 
               if (
@@ -801,16 +867,11 @@ export const autonomousSearch =
       }
 
       /*
-       * Limit results shown to frontend.
-       */
-      properties =
-        properties.slice(0, 10);
-
-      /*
        * Build a helpful no-results summary.
        */
       let searchSummary =
         '';
+      let isFallback = false;
 
       if (properties.length === 0) {
         if (
@@ -818,39 +879,75 @@ export const autonomousSearch =
         ) {
           const cityList =
             criteria.cities.join(', ');
-          searchSummary =
-            `No properties matching your ${criteria.bedrooms || ''} bedroom requirement were found in ${cityList}.`;
-        } else {
-          const prices =
-            bedroomMatchedProperties
-              .map((property) => ({
-                price:
-                  property.price,
-                crores:
-                  extractPriceInCrores(
-                    property.price
-                  ),
-              }))
-              .filter(
-                (item) =>
-                  item.crores > 0
-              )
-              .sort(
-                (a, b) =>
-                  a.crores -
-                  b.crores
-              );
-
-          if (prices.length > 0) {
-            const cheapest =
-              prices[0];
-
-            searchSummary =
-              `No exact matches were found. The closest ${criteria.bedrooms}+ bedroom option found starts at ${cheapest.price}.`;
-          } else {
-            searchSummary =
-              'No exact property matches were found for your search.';
+          const requirementParts = [];
+          if (criteria.bedrooms > 0) {
+            requirementParts.push(`${criteria.bedrooms} bedroom`);
           }
+          if (criteria.bathrooms > 0) {
+            requirementParts.push(`${criteria.bathrooms} bathroom`);
+          }
+          const requirementText = requirementParts.length > 0
+            ? requirementParts.join(' and ')
+            : 'your';
+          searchSummary =
+            `No properties matching your ${requirementText} requirement were found in ${cityList}.`;
+        } else {
+          const reqParts = [];
+          if (criteria.bedrooms > 0) reqParts.push(`${criteria.bedrooms}+ bedroom`);
+          if (criteria.bathrooms > 0) reqParts.push(`${criteria.bathrooms}+ bathroom`);
+          const reqText = reqParts.length > 0 ? reqParts.join(' and ') : 'matching';
+
+          let budgetText = '';
+          if (criteria.maxBudgetInCrores > 0) {
+            budgetText = `under Rs. ${criteria.maxBudgetInCrores} Crore`;
+          } else if (criteria.minBudgetInCrores > 0) {
+            budgetText = `above Rs. ${criteria.minBudgetInCrores} Crore`;
+          }
+
+          const priceRange = bedroomMatchedProperties
+            .map((p) => extractPriceInCrores(p.price))
+            .filter((p) => p > 0);
+
+          if (priceRange.length > 0) {
+            const minPrice = Math.min(...priceRange);
+            const maxPrice = Math.max(...priceRange);
+
+            searchSummary = budgetText
+              ? `No ${reqText} properties found ${budgetText}. Showing closest alternatives (Rs. ${minPrice}–${maxPrice} Crore):`
+              : `No ${reqText} properties found. Showing closest alternatives (Rs. ${minPrice}–${maxPrice} Crore):`;
+          } else {
+            searchSummary = `No exact matches found. Showing closest ${reqText} alternatives:`;
+          }
+
+          isFallback = true;
+
+          /*
+           * Sort fallback results by closeness to budget.
+           * If user specified max budget, show properties
+           * closest to that max from above.
+           * If user specified min budget, show properties
+           * closest to that min from below.
+           * Otherwise just sort by closest to middle of range.
+           */
+          const targetBudget =
+            criteria.maxBudgetInCrores > 0
+              ? criteria.maxBudgetInCrores
+              : criteria.minBudgetInCrores > 0
+                ? criteria.minBudgetInCrores
+                : 0;
+
+          properties = bedroomMatchedProperties
+            .sort((a, b) => {
+              const aPrice = extractPriceInCrores(a.price);
+              const bPrice = extractPriceInCrores(b.price);
+
+              if (targetBudget > 0) {
+                return Math.abs(aPrice - targetBudget) - Math.abs(bPrice - targetBudget);
+              }
+
+              return aPrice - bPrice;
+            })
+            .slice(0, 10);
         }
       } else {
         const cityList =
@@ -862,6 +959,12 @@ export const autonomousSearch =
               : 'ies'
           } in ${cityList}.`;
       }
+
+      /*
+       * Limit results shown to frontend.
+       */
+      properties =
+        properties.slice(0, 10);
 
       console.log(
         '[AI Search] Search summary:',
@@ -884,6 +987,7 @@ export const autonomousSearch =
         count: properties.length,
         properties,
         searchSummary,
+        isFallback,
       });
     } catch (error) {
       console.error(
