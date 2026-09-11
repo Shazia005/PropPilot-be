@@ -88,12 +88,8 @@ const cleanUrl = (value) => {
 
 const extractListingsFromPage = async (page) => {
   return await page.evaluate(() => {
-    /*
-     * Try the most likely Zameen listing-card selectors
-     * first. We avoid selecting every nested element
-     * containing the word "listing".
-     */
     const selectorGroups = [
+      'li[aria-label="Listing"]',
       '[data-testid="listing-card"]',
       '[data-testid="listing-card-container"]',
       'article',
@@ -113,10 +109,6 @@ const extractListingsFromPage = async (page) => {
       }
     }
 
-    /*
-     * If the above selectors are unavailable,
-     * find elements that contain a Zameen property URL.
-     */
     if (cards.length === 0) {
       const propertyLinks =
         Array.from(
@@ -162,14 +154,13 @@ const extractListingsFromPage = async (page) => {
       cards = possibleCards;
     }
 
-    /*
-     * Remove duplicate DOM elements.
-     */
     cards = Array.from(
       new Set(cards)
     );
 
     const listings = [];
+    let debugCount = 0;
+    const MAX_DEBUG = 10;
 
     for (const card of cards) {
       try {
@@ -180,9 +171,6 @@ const extractListingsFromPage = async (page) => {
           continue;
         }
 
-        /*
-         * Find the actual property URL.
-         */
         const links =
           Array.from(
             card.querySelectorAll(
@@ -213,9 +201,6 @@ const extractListingsFromPage = async (page) => {
           continue;
         }
 
-        /*
-         * Get clean text lines.
-         */
         const lines =
           text
             .split('\n')
@@ -227,80 +212,157 @@ const extractListingsFromPage = async (page) => {
         /*
          * PRICE
          *
-         * Scan individual lines to find the full price
-         * string including unit (e.g. "PKR 3.6 Crore",
-         * "49 Lakh", "3,60,00,000"). The full-text regex
-         * often misses the unit when it is on a separate
-         * line from the number.
+         * Primary: aria-label="Price" + aria-label="Currency"
+         * Skip aria-label="Installment Price" / "Demand" / secondary prices.
+         * Fallback: line scan with negative keyword filtering.
          */
         let price = '';
 
-        const priceUnitPattern =
-          /(?:PKR\s*)?([\d,.]+)\s*(Crore|Crores|Cr|Lakh|Lakhs|Million|Millions|Thousand|Thousands)?/i;
+        const priceSpan =
+          card.querySelector(
+            'span[aria-label="Price"]'
+          );
 
-        const unitOnlyPattern =
-          /\b(Crore|Crores|Cr|Lakh|Lakhs|Million|Millions|Thousand|Thousands)\b/i;
+        if (priceSpan) {
+          const priceText =
+            priceSpan.textContent.trim();
 
-        for (let i = 0; i < lines.length; i++) {
-          const priceLineMatch =
-            lines[i].match(priceUnitPattern);
-
-          if (
-            priceLineMatch &&
-            /PKR|Crore|Crores|Cr|Lakh|Lakhs|Million|Thousand|\d{2,}/i.test(
-              lines[i]
-            )
-          ) {
-            const numPart = priceLineMatch[1];
-
-            if (priceLineMatch[2]) {
-              price = `${numPart} ${priceLineMatch[2]}`;
-            } else {
-              let foundUnit = '';
-
-              for (let j = i + 1; j < Math.min(i + 10, lines.length); j++) {
-                const unitMatch = lines[j].match(unitOnlyPattern);
-                if (unitMatch) {
-                  foundUnit = unitMatch[1];
-                  break;
-                }
-              }
-
-              price = foundUnit
-                ? `${numPart} ${foundUnit}`
-                : numPart;
-            }
-
-            break;
-          }
-        }
-
-        /*
-         * Fallback: try the full text if line scanning
-         * did not find a price with a unit.
-         */
-        if (!price) {
-          const fullTextMatch =
-            text.match(
-              /(?:PKR\s*)?([\d,.]+)\s*(Crore|Crores|Cr|Lakh|Lakhs|Million|Millions|Thousand|Thousands)/i
+          const currencySpan =
+            card.querySelector(
+              'span[aria-label="Currency"]'
             );
 
-          if (fullTextMatch) {
-            price =
-              `${fullTextMatch[1]} ${fullTextMatch[2]}`;
+          const currencyText =
+            currencySpan
+              ? currencySpan.textContent.trim()
+              : '';
+
+          if (priceText) {
+            price = currencyText
+              ? `${currencyText} ${priceText}`
+              : priceText;
           }
         }
 
-        if (price && !unitOnlyPattern.test(price)) {
-          const numOnlyMatch = price.match(/([\d,.]+)/);
-          if (numOnlyMatch) {
-            const numStr = numOnlyMatch[1];
-            const numIdx = text.indexOf(numStr);
-            if (numIdx !== -1) {
-              const afterNum = text.substring(numIdx, numIdx + 80);
-              const lateUnitMatch = afterNum.match(unitOnlyPattern);
-              if (lateUnitMatch) {
-                price = `${numStr} ${lateUnitMatch[1]}`;
+        if (!price) {
+          const priceUnitPattern =
+            /(?:PKR\s*)?([\d,.]+)\s*(Crore|Crores|Cr|Lakh|Lakhs|Million|Millions|Thousand|Thousands)?/i;
+
+          const unitOnlyPattern =
+            /\b(Crore|Crores|Cr|Lakh|Lakhs|Million|Millions|Thousand|Thousands)\b/i;
+
+          const priceNegativePatterns = [
+            /down\s*payment/i,
+            /monthly/i,
+            /installment/i,
+            /\btoken\b/i,
+            /\bdemand\b/i,
+            /\badvance\b/i,
+            /maintenance/i,
+            /payment\s*plan/i,
+            /\brent\b/i,
+          ];
+
+          for (
+            let i = 0;
+            i < lines.length;
+            i++
+          ) {
+            if (
+              priceNegativePatterns.some(
+                (p) => p.test(lines[i])
+              )
+            ) {
+              continue;
+            }
+
+            const priceLineMatch =
+              lines[i].match(
+                priceUnitPattern
+              );
+
+            if (
+              priceLineMatch &&
+              /PKR|Crore|Crores|Cr|Lakh|Lakhs|Million|Thousand|\d{2,}/i.test(
+                lines[i]
+              )
+            ) {
+              const numPart =
+                priceLineMatch[1];
+
+              if (priceLineMatch[2]) {
+                price = `${numPart} ${priceLineMatch[2]}`;
+              } else {
+                let foundUnit = '';
+
+                for (
+                  let j = i + 1;
+                  j <
+                  Math.min(
+                    i + 10,
+                    lines.length
+                  );
+                  j++
+                ) {
+                  if (
+                    priceNegativePatterns.some(
+                      (p) =>
+                        p.test(lines[j])
+                    )
+                  ) {
+                    break;
+                  }
+
+                  const unitMatch =
+                    lines[j].match(
+                      unitOnlyPattern
+                    );
+
+                  if (unitMatch) {
+                    foundUnit =
+                      unitMatch[1];
+                    break;
+                  }
+                }
+
+                price = foundUnit
+                  ? `${numPart} ${foundUnit}`
+                  : numPart;
+              }
+
+              break;
+            }
+          }
+
+          if (
+            price &&
+            !unitOnlyPattern.test(price)
+          ) {
+            const numOnlyMatch =
+              price.match(/([\d,.]+)/);
+
+            if (numOnlyMatch) {
+              const numStr =
+                numOnlyMatch[1];
+
+              const numIdx =
+                text.indexOf(numStr);
+
+              if (numIdx !== -1) {
+                const afterNum =
+                  text.substring(
+                    numIdx,
+                    numIdx + 80
+                  );
+
+                const lateUnitMatch =
+                  afterNum.match(
+                    unitOnlyPattern
+                  );
+
+                if (lateUnitMatch) {
+                  price = `${numStr} ${lateUnitMatch[1]}`;
+                }
               }
             }
           }
@@ -309,58 +371,104 @@ const extractListingsFromPage = async (page) => {
         /*
          * BEDROOMS
          *
-         * Matches: 3 Bed, 3 Beds, 3 Bedroom, 3 Bedrooms,
-         * 3 Bed Room, 3 Bed Rooms, 3 Room, 3 Rooms,
-         * 3 Living Room, 3 Living Rooms, 3 Drawing Room,
-         * 3 Master Bedroom, 3 Master Bedrooms
+         * Primary: aria-label="Beds"
+         * Fallback: regex on card text.
          */
         let bedrooms = 0;
 
-        const bedroomMatch =
-          text.match(
-            /(\d+)\s*(?:master\s*)?(?:bed(?:\s*room)?s?|bedroom(?:\s*room)?s?|living\s*rooms?|drawing\s*rooms?|sleeping\s*rooms?|rooms?)\b/i
+        const bedSpan =
+          card.querySelector(
+            'span[aria-label="Beds"]'
           );
 
-        if (bedroomMatch) {
-          bedrooms =
-            Number(
-              bedroomMatch[1]
+        if (bedSpan) {
+          const numMatch =
+            bedSpan.textContent.match(
+              /(\d+)/
             );
+
+          if (numMatch) {
+            bedrooms =
+              Number(numMatch[1]);
+          }
+        }
+
+        if (bedrooms === 0) {
+          const bedroomMatch =
+            text.match(
+              /(\d+)\s*(?:master\s*)?(?:bed(?:\s*room)?s?|bedroom(?:\s*room)?s?|living\s*rooms?|drawing\s*rooms?|sleeping\s*rooms?|rooms?)\b/i
+            );
+
+          if (bedroomMatch) {
+            bedrooms =
+              Number(
+                bedroomMatch[1]
+              );
+          }
         }
 
         /*
          * BATHROOMS
          *
-         * Matches: 2 Bath, 2 Baths, 2 Bathroom, 2 Bathrooms,
-         * 2 Bath Room, 2 Bath Rooms, 2 Washroom, 2 Washrooms,
-         * 2 Wash Room, 2 Wash Rooms, 2 Toilet, 2 Toilets,
-         * 2 Ensuite, 2 Ensuites, 2 Powder Room,
-         * 4+1 Bath, 4 / 2 (bed/bath format)
+         * Primary: aria-label="Baths" / aria-label="Bathrooms"
+         * Fallback 1: regex on card text.
+         * Fallback 2: broader DOM selectors.
+         * NEVER assume bathrooms = bedrooms.
          */
-        let bathrooms = 0;
+        let bathrooms = null;
 
-        const bathroomPatterns = [
-          /(\d+)\s*(?:\+\d+)?\s*(?:bath(?:\s*room)?s?|wash\s*rooms?|toilets?|ensuites?|powder\s*rooms?|half\s*baths?|powder\s*baths?)\b/i,
-          /bath(?:room)?s?\s*[:\-\/]\s*(\d+)/i,
-          /(\d+)\s*baths?\b/i,
-        ];
+        const bathSpan =
+          card.querySelector(
+            'span[aria-label="Baths"]'
+          ) ||
+          card.querySelector(
+            'span[aria-label="Bathrooms"]'
+          ) ||
+          card.querySelector(
+            'span[aria-label="baths"]'
+          ) ||
+          card.querySelector(
+            'span[aria-label="bathrooms"]'
+          );
 
-        for (const pattern of bathroomPatterns) {
-          const match = text.match(pattern);
-          if (match) {
-            bathrooms = Number(match[1]);
-            break;
+        if (bathSpan) {
+          const numMatch =
+            bathSpan.textContent.match(
+              /(\d+)/
+            );
+
+          if (numMatch) {
+            bathrooms =
+              Number(numMatch[1]);
           }
         }
 
-        /*
-         * Fallback: look for bathroom info in separate
-         * card elements (Zameen sometimes uses icons)
-         */
-        if (bathrooms === 0) {
+        if (bathrooms === null) {
+          const bathroomPatterns = [
+            /(\d+)\s*(?:\+\d+)?\s*(?:bath(?:\s*room)?s?|wash\s*rooms?|toilets?|ensuites?|powder\s*rooms?|half\s*baths?|powder\s*baths?)\b/i,
+            /bath(?:room)?s?\s*[:\-\/]\s*(\d+)/i,
+            /(\d+)\s*baths?\b/i,
+          ];
+
+          for (
+            const pattern
+            of bathroomPatterns
+          ) {
+            const match =
+              text.match(pattern);
+
+            if (match) {
+              bathrooms =
+                Number(match[1]);
+              break;
+            }
+          }
+        }
+
+        if (bathrooms === null) {
           const bathElements =
             card.querySelectorAll(
-              '[data-testid*="bath"], [class*="bath"], [aria-label*="bath"]'
+              '[data-testid*="bath" i], [class*="bath" i], [aria-label*="bath" i]'
             );
 
           for (
@@ -383,9 +491,48 @@ const extractListingsFromPage = async (page) => {
           }
         }
 
-        /*
-         * AREA
-         */
+        if (debugCount < MAX_DEBUG) {
+          debugCount++;
+          const titleHint =
+            text
+              .split('\n')
+              .map((l) => l.trim())
+              .filter(Boolean)
+              .find(
+                (l) =>
+                  l.length > 15 &&
+                  l.length < 250 &&
+                  !/^PKR/i.test(l)
+              ) ||
+            '(no title)';
+
+          console.log(
+            '[Scraper] Debug listing #' + debugCount + ':'
+          );
+          console.log(
+            `  title: ${titleHint}`
+          );
+          console.log(
+            `  aria-label Price: ${priceSpan ? priceSpan.textContent.trim() : '(none)'}`
+          );
+          console.log(
+            `  selected price: ${price || '(empty)'}`
+          );
+          console.log(
+            `  aria-label Beds: ${bedSpan ? bedSpan.textContent.trim() : '(none)'}`
+          );
+          console.log(
+            `  extracted bedrooms: ${bedrooms}`
+          );
+          console.log(
+            `  aria-label Baths: ${bathSpan ? bathSpan.textContent.trim() : '(none)'}`
+          );
+          console.log(
+            `  extracted bathrooms: ${bathrooms === null ? 'null (unknown)' : bathrooms}`
+          );
+          console.log('');
+        }
+
         let area = '';
 
         const areaMatch =
@@ -398,9 +545,6 @@ const extractListingsFromPage = async (page) => {
             `${areaMatch[1]} ${areaMatch[2]}`;
         }
 
-        /*
-         * IMAGE
-         */
         const imageElement =
           card.querySelector(
             'img'
@@ -426,12 +570,6 @@ const extractListingsFromPage = async (page) => {
             '';
         }
 
-        /*
-         * TITLE
-         *
-         * Prefer headings and explicit title
-         * elements.
-         */
         let title = '';
 
         const titleSelectors = [
@@ -465,10 +603,6 @@ const extractListingsFromPage = async (page) => {
           }
         }
 
-        /*
-         * If no title was found, look through
-         * text lines for a likely property title.
-         */
         if (!title) {
           for (
             const line
@@ -525,83 +659,71 @@ const extractListingsFromPage = async (page) => {
         /*
          * LOCATION
          *
-         * Look for a line containing common
-         * Pakistani city/area patterns.
+         * Primary: aria-label="Location"
+         * Fallback: scan lines for city names.
          */
         let location = '';
 
-        /*
-         * Non-location words that should never be
-         * treated as a property location.
-         */
-        const rejectWords = [
-          'verified',
-          'hot',
-          'featured',
-          'new',
-          'titanium',
-          'premium',
-          'agent',
-          'broker',
-          'proprietor',
-          'contact',
-          'available',
-          'rent',
-          'sale',
-          'sell',
-          'buy',
-          'invest',
-          'deal',
-          'token',
-          'advance',
-          'negotiable',
-          'demand',
-          'urgent',
-          'offer',
-        ];
+        const locationDiv =
+          card.querySelector(
+            'div[aria-label="Location"]'
+          );
 
-        const isRejectedLocation = (value) => {
-          if (!value) return true;
-          const lower = value.toLowerCase().trim();
-          if (lower.length < 3) return true;
-          return rejectWords.includes(lower);
-        };
-
-        const locationSelectors = [
-          '[data-testid*="location"]',
-          '[class*="location"]',
-          '[class*="area"]',
-        ];
-
-        for (
-          const selector
-          of locationSelectors
-        ) {
-          const element =
-            card.querySelector(
-              selector
-            );
-
-          const value =
-            element?.innerText?.trim();
+        if (locationDiv) {
+          const locText =
+            locationDiv.textContent.trim();
 
           if (
-            value &&
-            value.length > 2 &&
-            !/PKR/i.test(value) &&
-            !isRejectedLocation(value)
+            locText &&
+            locText.length > 2 &&
+            !/PKR/i.test(locText)
           ) {
-            location =
-              value;
-            break;
+            location = locText;
           }
         }
 
-        /*
-         * If selector-based location fails,
-         * inspect lines.
-         */
         if (!location) {
+          const rejectWords = [
+            'verified',
+            'hot',
+            'featured',
+            'new',
+            'titanium',
+            'premium',
+            'agent',
+            'broker',
+            'proprietor',
+            'contact',
+            'available',
+            'rent',
+            'sale',
+            'sell',
+            'buy',
+            'invest',
+            'deal',
+            'token',
+            'advance',
+            'negotiable',
+            'demand',
+            'urgent',
+            'offer',
+          ];
+
+          const isRejectedLocation = (
+            value
+          ) => {
+            if (!value) return true;
+            const lower =
+              value
+                .toLowerCase()
+                .trim();
+            if (lower.length < 3)
+              return true;
+            return rejectWords.includes(
+              lower
+            );
+          };
+
           const cityNames = [
             'Islamabad',
             'Lahore',
@@ -637,76 +759,69 @@ const extractListingsFromPage = async (page) => {
               break;
             }
           }
-        }
 
-        /*
-         * Final fallback for location:
-         * find a reasonable line that isn't
-         * price/area/bed/bath/status text.
-         */
-        if (!location) {
-          for (
-            const line
-            of lines
-          ) {
-            if (
-              line === title ||
-              line === price
+          if (!location) {
+            for (
+              const line
+              of lines
             ) {
-              continue;
-            }
+              if (
+                line === title ||
+                line === price
+              ) {
+                continue;
+              }
 
-            if (
-              /PKR|Crore|Lakh|Million|Thousand/i.test(
-                line
-              )
-            ) {
-              continue;
-            }
+              if (
+                /PKR|Crore|Lakh|Million|Thousand/i.test(
+                  line
+                )
+              ) {
+                continue;
+              }
 
-            if (
-              /(?:bed(?:\s*room)?s?|bath(?:\s*room)?s?|wash\s*rooms?|toilets?|ensuites?|powder\s*rooms?|living\s*rooms?|drawing\s*rooms?|rooms?)/i.test(
-                line
-              )
-            ) {
-              continue;
-            }
+              if (
+                /(?:bed(?:\s*room)?s?|bath(?:\s*room)?s?|wash\s*rooms?|toilets?|ensuites?|powder\s*rooms?|living\s*rooms?|drawing\s*rooms?|rooms?)/i.test(
+                  line
+                )
+              ) {
+                continue;
+              }
 
-            if (
-              /sq\.?\s*(?:ft|yd)|sqft|kanal|marla/i.test(
-                line
-              )
-            ) {
-              continue;
-            }
+              if (
+                /sq\.?\s*(?:ft|yd)|sqft|kanal|marla/i.test(
+                  line
+                )
+              ) {
+                continue;
+              }
 
-            if (
-              /SUPER HOT|HOT|TITANIUM/i.test(
-                line
-              )
-            ) {
-              continue;
-            }
+              if (
+                /SUPER HOT|HOT|TITANIUM/i.test(
+                  line
+                )
+              ) {
+                continue;
+              }
 
-            if (isRejectedLocation(line)) {
-              continue;
-            }
+              if (
+                isRejectedLocation(line)
+              ) {
+                continue;
+              }
 
-            if (
-              line.length >= 3 &&
-              line.length <= 100
-            ) {
-              location =
-                line;
-              break;
+              if (
+                line.length >= 3 &&
+                line.length <= 100
+              ) {
+                location =
+                  line;
+                break;
+              }
             }
           }
         }
 
-        /*
-         * Only keep listings that have a real
-         * property URL.
-         */
         listings.push({
           rawId: link,
           rawTitle:
@@ -727,6 +842,10 @@ const extractListingsFromPage = async (page) => {
           rawArea:
             area ||
             'N/A',
+          rawBathroomsFound:
+            bathSpan
+              ? bathSpan.textContent.trim()
+              : null,
         });
       } catch (error) {
         console.error(
@@ -847,7 +966,54 @@ export const scrapeListings = async (
 
         const queryParams = [];
 
-        if (criteria.bedrooms > 0) {
+        if (
+          criteria.bedroomFilterType === 'exact' &&
+          criteria.bedrooms > 0
+        ) {
+          queryParams.push(
+            `bedrooms_min=${criteria.bedrooms}`
+          );
+          queryParams.push(
+            `bedrooms_max=${criteria.bedrooms}`
+          );
+        } else if (
+          criteria.bedroomFilterType === 'minimum' &&
+          criteria.bedrooms > 0
+        ) {
+          queryParams.push(
+            `bedrooms_min=${criteria.bedrooms}`
+          );
+        } else if (
+          criteria.bedroomFilterType === 'or' &&
+          criteria.bedroomOptions &&
+          criteria.bedroomOptions.length > 0
+        ) {
+          const minOpt = Math.min(
+            ...criteria.bedroomOptions
+          );
+          const maxOpt = Math.max(
+            ...criteria.bedroomOptions
+          );
+          queryParams.push(
+            `bedrooms_min=${minOpt}`
+          );
+          queryParams.push(
+            `bedrooms_max=${maxOpt}`
+          );
+        } else if (
+          criteria.bedroomFilterType === 'range' &&
+          criteria.bedroomMin > 0 &&
+          criteria.bedroomMax > 0
+        ) {
+          queryParams.push(
+            `bedrooms_min=${criteria.bedroomMin}`
+          );
+          queryParams.push(
+            `bedrooms_max=${criteria.bedroomMax}`
+          );
+        } else if (
+          criteria.bedrooms > 0
+        ) {
           queryParams.push(
             `bedrooms_min=${criteria.bedrooms}`
           );
@@ -898,21 +1064,43 @@ export const scrapeListings = async (
             }
           );
 
-          await new Promise(
-            (resolve) =>
-              setTimeout(
-                resolve,
-                1500
-              )
-          );
+          try {
+            await page.waitForSelector(
+              'span[aria-label="Beds"], span[aria-label="Baths"], li[aria-label="Listing"], a[href*="/Property/"]',
+              { timeout: 10000 }
+            );
+          } catch {
+            await new Promise(
+              (resolve) =>
+                setTimeout(
+                  resolve,
+                  3000
+                )
+            );
+          }
 
           const listings =
             await extractListingsFromPage(
               page
             );
 
+          const withBathrooms =
+            listings.filter(
+              (l) =>
+                l.rawBathrooms !== null &&
+                l.rawBathrooms > 0
+            ).length;
+
+          const withPrice =
+            listings.filter(
+              (l) =>
+                l.rawPrice &&
+                l.rawPrice !==
+                  'Price unavailable'
+            ).length;
+
           console.log(
-            `[Scraper] Page ${pageNumber}: extracted ${listings.length} listings`
+            `[Scraper] Page ${pageNumber}: ${listings.length} listings, ${withBathrooms} with bathrooms, ${withPrice} with price`
           );
 
           const listingsWithTag = listings.map(
@@ -936,9 +1124,6 @@ export const scrapeListings = async (
         }
       }
 
-      /*
-       * Clean URLs and images.
-       */
       const cleanedListings =
         allListings.map(
           (listing) => {
@@ -967,9 +1152,6 @@ export const scrapeListings = async (
           }
         );
 
-      /*
-       * Remove duplicate listings.
-       */
       const uniqueListings = [];
 
       const seen =
@@ -1001,6 +1183,25 @@ export const scrapeListings = async (
 
       console.log(
         `[Scraper] Total unique listings: ${uniqueListings.length}`
+      );
+
+      const finalWithBath =
+        uniqueListings.filter(
+          (l) =>
+            l.rawBathrooms !== null &&
+            l.rawBathrooms > 0
+        ).length;
+
+      const finalWithPrice =
+        uniqueListings.filter(
+          (l) =>
+            l.rawPrice &&
+            l.rawPrice !==
+              'Price unavailable'
+        ).length;
+
+      console.log(
+        `[Scraper] Summary: ${uniqueListings.length} total, ${finalWithBath} with bathrooms, ${finalWithPrice} with valid price`
       );
 
       if (

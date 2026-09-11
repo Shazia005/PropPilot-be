@@ -4,6 +4,7 @@ import { scrapeListings } from '../services/scraper.js';
 const GEMINI_MODEL = 'gemini-3.6-flash';
 const GEMINI_TIMEOUT = 30000;
 const GEMINI_RETRY_ATTEMPTS = 3;
+const MAX_RESULTS = 20;
 
 const ai = new GoogleGenAI({
   apiKey: process.env.GEMINI_API_KEY,
@@ -11,7 +12,7 @@ const ai = new GoogleGenAI({
 
 /*
  * Convert price string into Crore value.
- * e.g. "3.6 Crore" → 3.6, "49 Lakh" → 0.49, "36500000" → 3.65
+ * e.g. "3.6 Crore" -> 3.6, "49 Lakh" -> 0.49, "36500000" -> 3.65
  */
 const extractPriceInCrores = (price) => {
   if (
@@ -85,8 +86,8 @@ const normalizeProperty = (property) => {
       0
   );
 
-  if (bathrooms === 0 && bedrooms > 0) {
-    bathrooms = bedrooms;
+  if (bathrooms === 0) {
+    bathrooms = null;
   }
 
   return {
@@ -240,35 +241,53 @@ Return exactly this structure:
 {
   "cities": [],
   "propertyType": "",
+  "bedroomFilterType": "exact",
   "bedrooms": 0,
+  "bedroomMin": 0,
+  "bedroomMax": 0,
+  "bedroomOptions": [],
+  "bathroomFilterType": "exact",
   "bathrooms": 0,
+  "bathroomMin": 0,
+  "bathroomMax": 0,
+  "bathroomOptions": [],
   "minBudgetInCrores": 0,
   "maxBudgetInCrores": 0
 }
 
 Rules:
 
-1. Extract ALL cities mentioned in the request into the "cities" array.
-   If the user mentions multiple cities (e.g. "rawalpindi and islamabad"),
-   include ALL of them: ["rawalpindi", "islamabad"].
-   If only one city is mentioned, put it in a single-element array: ["islamabad"].
-   If no city is mentioned, use ["islamabad"] as default.
-2. Convert "flat" or "flats" to "apartment".
-3. If the user says "no apartments", "don't include apartments", "exclude apartments", "not apartments", "house not apartment", or any similar negative phrasing about a property type, still set propertyType to "house" (the desired type). The fallback parser handles this with negation detection; do the same here.
-4. Extract bedroom count from keywords like "bedroom", "beds", "bed", "rooms", "sleeping rooms".
-5. Extract bathroom count from keywords like "bath", "baths", "bathroom", "bathrooms", "washroom", "washrooms", "toilet", "toilets", "ensuite", "ensuites", "half bath", "powder room".
+1. Extract ALL cities mentioned into "cities" array. Include ALL of them.
+   If only one city, single-element array. If no city, use ["islamabad"].
+2. "flat"/"flats" -> "apartment".
+3. Negative phrasing about property type -> set desired type.
+4. Extract bedroom count from keywords: "bedroom", "beds", "bed", "rooms".
+5. Extract bathroom count from keywords: "bath", "baths", "bathroom", "bathrooms", "washroom", "washrooms", "toilet", "toilets", "ensuite", "ensuites", "half bath", "powder room".
 6. Convert Pakistani budget expressions to Crore.
-7. "under 3 crore" means maxBudgetInCrores = 3.
-8. "below 5 crore" means maxBudgetInCrores = 5.
-9. "between 2 and 4 crore" means min = 2 and max = 4.
-10. "within 5-10 crore range" means min = 5 and max = 10.
-11. "within 2 to 5 crore" means min = 2 and max = 5.
-12. If no minimum budget is given, use 0.
-13. If no maximum budget is given, use 0.
-14. If bedrooms are not specified, use 0.
-15. If bathrooms are not specified, use 0.
-16. Do not add explanations.
-17. Return JSON only.
+
+Bedroom filter rules:
+- "2 rooms", "2 bedrooms", "exactly 2 bedrooms", "2 bed" -> bedroomFilterType: "exact", bedrooms: 2
+- "2+ bedrooms", "at least 2 bedrooms", "2 or more bedrooms" -> bedroomFilterType: "minimum", bedrooms: 2
+- "3 or 4 bedrooms", "3/4 bedrooms" -> bedroomFilterType: "or", bedroomOptions: [3, 4]
+- "between 3 and 5 bedrooms", "3 to 5 bedrooms" -> bedroomFilterType: "range", bedroomMin: 3, bedroomMax: 5
+- If no bedrooms mentioned -> bedroomFilterType: "exact", bedrooms: 0
+
+Bathroom filter rules:
+- "2 baths", "2 bathrooms", "exactly 2 bathrooms" -> bathroomFilterType: "exact", bathrooms: 2
+- "2+ baths", "at least 2 bathrooms" -> bathroomFilterType: "minimum", bathrooms: 2
+- "between 2 and 3 baths" -> bathroomFilterType: "range", bathroomMin: 2, bathroomMax: 3
+- If no bathrooms mentioned -> bathroomFilterType: "exact", bathrooms: 0
+
+Budget rules:
+- "under 3 crore" -> maxBudgetInCrores: 3
+- "below 5 crore" -> maxBudgetInCrores: 5
+- "between 2 and 4 crore" -> min: 2, max: 4
+- "within 5-10 crore range" -> min: 5, max: 10
+- "within 2 to 5 crore" -> min: 2, max: 5
+- If no minimum budget, use 0.
+- If no maximum budget, use 0.
+
+Do not add explanations. Return JSON only.
 
 User request:
 ${userPrompt}
@@ -460,30 +479,164 @@ const extractFallbackCriteria = (
       ? matchedCities
       : ['islamabad'];
 
+  /*
+   * Bedroom detection with filter types.
+   */
+  let bedroomFilterType = 'exact';
   let bedrooms = 0;
+  let bedroomMin = 0;
+  let bedroomMax = 0;
+  let bedroomOptions = [];
 
-  const bedroomMatch =
-    text.match(
-      /(\d+)\s*(?:master\s*)?(?:bed(?:\s*room)?s?|bedroom(?:\s*room)?s?|living\s*rooms?|drawing\s*rooms?|sleeping\s*rooms?|rooms?)\b/i
+  const bedroomKeywords =
+    /(?:master\s*)?(?:bed(?:\s*room)?s?|bedroom(?:\s*room)?s?|living\s*rooms?|drawing\s*rooms?|sleeping\s*rooms?|rooms?)\b/i;
+
+  const orBedroomMatch = text.match(
+    new RegExp(
+      `(\\d+)\\s*or\\s*(\\d+)\\s*${bedroomKeywords.source}`,
+      'i'
+    )
+  );
+
+  if (orBedroomMatch) {
+    bedroomFilterType = 'or';
+    bedroomOptions = [
+      Number(orBedroomMatch[1]),
+      Number(orBedroomMatch[2])
+    ];
+  } else {
+    const rangeBedroomMatch = text.match(
+      new RegExp(
+        `(?:between|from)\\s+(\\d+)\\s*(?:and|-|to)\\s*(\\d+)\\s*${bedroomKeywords.source}`,
+        'i'
+      )
     );
 
-  if (bedroomMatch) {
-    bedrooms = Number(
-      bedroomMatch[1]
-    );
+    if (rangeBedroomMatch) {
+      bedroomFilterType = 'range';
+      bedroomMin = Number(
+        rangeBedroomMatch[1]
+      );
+      bedroomMax = Number(
+        rangeBedroomMatch[2]
+      );
+    } else {
+      const minBedroomMatch =
+        text.match(
+          new RegExp(
+            `(\\d+)\\s*\\+\\s*${bedroomKeywords.source}`,
+            'i'
+          )
+        ) ||
+        text.match(
+          new RegExp(
+            `at\\s*least\\s+(\\d+)\\s*${bedroomKeywords.source}`,
+            'i'
+          )
+        );
+
+      if (minBedroomMatch) {
+        bedroomFilterType = 'minimum';
+        bedrooms = Number(
+          minBedroomMatch[1]
+        );
+      } else {
+        const exactBedroomMatch =
+          text.match(
+            new RegExp(
+              `(\\d+)\\s*${bedroomKeywords.source}`,
+              'i'
+            )
+          );
+
+        if (exactBedroomMatch) {
+          bedroomFilterType = 'exact';
+          bedrooms = Number(
+            exactBedroomMatch[1]
+          );
+        }
+      }
+    }
   }
 
+  /*
+   * Bathroom detection with filter types.
+   */
+  let bathroomFilterType = 'exact';
   let bathrooms = 0;
+  let bathroomMin = 0;
+  let bathroomMax = 0;
+  let bathroomOptions = [];
 
-  const bathroomMatch =
-    text.match(
-      /(\d+)\s*(?:bath(?:\s*room)?s?|baths?|wash\s*rooms?|toilets?|ensuites?|powder\s*rooms?|half\s*baths?)\b/i
+  const bathroomKeywords =
+    /(?:bath(?:\s*room)?s?|wash\s*rooms?|toilets?|ensuites?|powder\s*rooms?|half\s*baths?|powder\s*baths?)\b/i;
+
+  const orBathMatch = text.match(
+    new RegExp(
+      `(\\d+)\\s*or\\s*(\\d+)\\s*${bathroomKeywords.source}`,
+      'i'
+    )
+  );
+
+  if (orBathMatch) {
+    bathroomFilterType = 'or';
+    bathroomOptions = [
+      Number(orBathMatch[1]),
+      Number(orBathMatch[2])
+    ];
+  } else {
+    const rangeBathMatch = text.match(
+      new RegExp(
+        `(?:between|from)\\s+(\\d+)\\s*(?:and|-|to)\\s*(\\d+)\\s*${bathroomKeywords.source}`,
+        'i'
+      )
     );
 
-  if (bathroomMatch) {
-    bathrooms = Number(
-      bathroomMatch[1]
-    );
+    if (rangeBathMatch) {
+      bathroomFilterType = 'range';
+      bathroomMin = Number(
+        rangeBathMatch[1]
+      );
+      bathroomMax = Number(
+        rangeBathMatch[2]
+      );
+    } else {
+      const minBathMatch =
+        text.match(
+          new RegExp(
+            `(\\d+)\\s*\\+\\s*${bathroomKeywords.source}`,
+            'i'
+          )
+        ) ||
+        text.match(
+          new RegExp(
+            `at\\s*least\\s+(\\d+)\\s*${bathroomKeywords.source}`,
+            'i'
+          )
+        );
+
+      if (minBathMatch) {
+        bathroomFilterType = 'minimum';
+        bathrooms = Number(
+          minBathMatch[1]
+        );
+      } else {
+        const exactBathMatch =
+          text.match(
+            new RegExp(
+              `(\\d+)\\s*${bathroomKeywords.source}`,
+              'i'
+            )
+          );
+
+        if (exactBathMatch) {
+          bathroomFilterType = 'exact';
+          bathrooms = Number(
+            exactBathMatch[1]
+          );
+        }
+      }
+    }
   }
 
   let minBudgetInCrores = 0;
@@ -536,8 +689,16 @@ const extractFallbackCriteria = (
   return {
     cities: citiesResult,
     propertyType,
+    bedroomFilterType,
     bedrooms,
+    bedroomMin,
+    bedroomMax,
+    bedroomOptions,
+    bathroomFilterType,
     bathrooms,
+    bathroomMin,
+    bathroomMax,
+    bathroomOptions,
     minBudgetInCrores,
     maxBudgetInCrores,
   };
@@ -572,6 +733,88 @@ const normalizeCriteria = (
     cities = ['islamabad'];
   }
 
+  let bedroomFilterType =
+    String(
+      criteria?.bedroomFilterType || 'exact'
+    )
+      .toLowerCase()
+      .trim();
+
+  let bedrooms = Number(
+    criteria?.bedrooms || 0
+  );
+
+  let bedroomMin = Number(
+    criteria?.bedroomMin || 0
+  );
+
+  let bedroomMax = Number(
+    criteria?.bedroomMax || 0
+  );
+
+  let bedroomOptions =
+    Array.isArray(
+      criteria?.bedroomOptions
+    )
+      ? criteria.bedroomOptions
+          .map(Number)
+          .filter(
+            (n) => n > 0
+          )
+      : [];
+
+  if (
+    ![
+      'exact',
+      'minimum',
+      'or',
+      'range'
+    ].includes(bedroomFilterType)
+  ) {
+    bedroomFilterType = 'exact';
+  }
+
+  let bathroomFilterType =
+    String(
+      criteria?.bathroomFilterType || 'exact'
+    )
+      .toLowerCase()
+      .trim();
+
+  let bathrooms = Number(
+    criteria?.bathrooms || 0
+  );
+
+  let bathroomMin = Number(
+    criteria?.bathroomMin || 0
+  );
+
+  let bathroomMax = Number(
+    criteria?.bathroomMax || 0
+  );
+
+  let bathroomOptions =
+    Array.isArray(
+      criteria?.bathroomOptions
+    )
+      ? criteria.bathroomOptions
+          .map(Number)
+          .filter(
+            (n) => n > 0
+          )
+      : [];
+
+  if (
+    ![
+      'exact',
+      'minimum',
+      'or',
+      'range'
+    ].includes(bathroomFilterType)
+  ) {
+    bathroomFilterType = 'exact';
+  }
+
   return {
     cities,
 
@@ -583,13 +826,17 @@ const normalizeCriteria = (
         .toLowerCase()
         .trim(),
 
-    bedrooms: Number(
-      criteria?.bedrooms || 0
-    ),
+    bedroomFilterType,
+    bedrooms,
+    bedroomMin,
+    bedroomMax,
+    bedroomOptions,
 
-    bathrooms: Number(
-      criteria?.bathrooms || 0
-    ),
+    bathroomFilterType,
+    bathrooms,
+    bathroomMin,
+    bathroomMax,
+    bathroomOptions,
 
     minBudgetInCrores: Number(
       criteria?.minBudgetInCrores || 0
@@ -599,6 +846,284 @@ const normalizeCriteria = (
       criteria?.maxBudgetInCrores || 0
     ),
   };
+};
+
+/*
+ * Check if a bedroom value matches the criteria.
+ */
+const matchesBedroomFilter = (
+  propertyBedrooms,
+  criteria
+) => {
+  const beds = Number(
+    propertyBedrooms || 0
+  );
+
+  switch (
+    criteria.bedroomFilterType
+  ) {
+    case 'exact':
+      return beds === criteria.bedrooms;
+
+    case 'minimum':
+      return beds >= criteria.bedrooms;
+
+    case 'or':
+      return criteria.bedroomOptions.includes(
+        beds
+      );
+
+    case 'range':
+      return (
+        beds >= criteria.bedroomMin &&
+        beds <= criteria.bedroomMax
+      );
+
+    default:
+      return beds === criteria.bedrooms;
+  }
+};
+
+/*
+ * Check if a bathroom value matches the criteria.
+ * Returns false for null/unknown when a requirement exists.
+ */
+const matchesBathroomFilter = (
+  propertyBathrooms,
+  criteria
+) => {
+  if (
+    propertyBathrooms === null ||
+    propertyBathrooms === undefined
+  ) {
+    return false;
+  }
+
+  const baths = Number(
+    propertyBathrooms
+  );
+
+  switch (
+    criteria.bathroomFilterType
+  ) {
+    case 'exact':
+      return baths === criteria.bathrooms;
+
+    case 'minimum':
+      return baths >= criteria.bathrooms;
+
+    case 'or':
+      return criteria.bathroomOptions.includes(
+        baths
+      );
+
+    case 'range':
+      return (
+        baths >= criteria.bathroomMin &&
+        baths <= criteria.bathroomMax
+      );
+
+    default:
+      return baths === criteria.bathrooms;
+  }
+};
+
+/*
+ * Get a human-readable bedroom requirement text.
+ */
+const getBedroomText = (criteria) => {
+  switch (
+    criteria.bedroomFilterType
+  ) {
+    case 'exact':
+      return criteria.bedrooms > 0
+        ? `${criteria.bedrooms} bedroom`
+        : null;
+
+    case 'minimum':
+      return criteria.bedrooms > 0
+        ? `${criteria.bedrooms}+ bedroom`
+        : null;
+
+    case 'or':
+      return criteria.bedroomOptions.length >
+        0
+        ? `${criteria.bedroomOptions.join(
+            ' or '
+          )} bedroom`
+        : null;
+
+    case 'range':
+      return criteria.bedroomMin > 0 &&
+        criteria.bedroomMax > 0
+        ? `${criteria.bedroomMin}-${criteria.bedroomMax} bedroom`
+        : null;
+
+    default:
+      return null;
+  }
+};
+
+/*
+ * Get a human-readable bathroom requirement text.
+ */
+const getBathroomText = (criteria) => {
+  switch (
+    criteria.bathroomFilterType
+  ) {
+    case 'exact':
+      return criteria.bathrooms > 0
+        ? `${criteria.bathrooms} bathroom`
+        : null;
+
+    case 'minimum':
+      return criteria.bathrooms > 0
+        ? `${criteria.bathrooms}+ bathroom`
+        : null;
+
+    case 'or':
+      return criteria.bathroomOptions
+        .length > 0
+        ? `${criteria.bathroomOptions.join(
+            ' or '
+          )} bathroom`
+        : null;
+
+    case 'range':
+      return criteria.bathroomMin > 0 &&
+        criteria.bathroomMax > 0
+        ? `${criteria.bathroomMin}-${criteria.bathroomMax} bathroom`
+        : null;
+
+    default:
+      return null;
+  }
+};
+
+/*
+ * Distribute properties fairly across requested cities
+ * using round-robin selection.
+ */
+const distributeFairly = (
+  properties,
+  cities,
+  limit
+) => {
+  if (
+    !cities ||
+    cities.length <= 1
+  ) {
+    return properties.slice(0, limit);
+  }
+
+  const cityLowerSet = new Set(
+    cities.map((c) => c.toLowerCase())
+  );
+
+  const byCity = {};
+
+  for (const city of cities) {
+    byCity[city.toLowerCase()] = [];
+  }
+
+  for (const prop of properties) {
+    const propCity = (
+      prop.city || ''
+    )
+      .toLowerCase()
+      .trim();
+
+    if (cityLowerSet.has(propCity)) {
+      byCity[propCity].push(prop);
+    }
+  }
+
+  const result = [];
+  const cityKeys = cities.map((c) =>
+    c.toLowerCase()
+  );
+  let index = 0;
+
+  while (result.length < limit) {
+    let added = false;
+
+    for (const cityKey of cityKeys) {
+      const cityProps =
+        byCity[cityKey] || [];
+
+      if (index < cityProps.length) {
+        result.push(cityProps[index]);
+        added = true;
+
+        if (result.length >= limit) {
+          break;
+        }
+      }
+    }
+
+    if (!added) break;
+    index++;
+  }
+
+  return result;
+};
+
+/*
+ * Check if there is any explicit bedroom requirement.
+ */
+const hasBedroomRequirement = (
+  criteria
+) => {
+  switch (
+    criteria.bedroomFilterType
+  ) {
+    case 'exact':
+    case 'minimum':
+      return criteria.bedrooms > 0;
+
+    case 'or':
+      return (
+        criteria.bedroomOptions.length > 0
+      );
+
+    case 'range':
+      return (
+        criteria.bedroomMin > 0 ||
+        criteria.bedroomMax > 0
+      );
+
+    default:
+      return false;
+  }
+};
+
+/*
+ * Check if there is any explicit bathroom requirement.
+ */
+const hasBathroomRequirement = (
+  criteria
+) => {
+  switch (
+    criteria.bathroomFilterType
+  ) {
+    case 'exact':
+    case 'minimum':
+      return criteria.bathrooms > 0;
+
+    case 'or':
+      return (
+        criteria.bathroomOptions.length > 0
+      );
+
+    case 'range':
+      return (
+        criteria.bathroomMin > 0 ||
+        criteria.bathroomMax > 0
+      );
+
+    default:
+      return false;
+  }
 };
 
 /*
@@ -676,14 +1201,13 @@ export const autonomousSearch =
         criteria
       );
 
+      console.log(
+        `[AI Search] Cities: ${criteria.cities.join(', ')}`
+      );
+
       /*
        * Search Zameen for each city.
        */
-      console.log(
-        '[AI Search] Searching Zameen for cities:',
-        criteria.cities
-      );
-
       let scrapedProperties = [];
 
       for (
@@ -710,8 +1234,7 @@ export const autonomousSearch =
       }
 
       console.log(
-        '[AI Search] Total scraped:',
-        scrapedProperties.length
+        `[AI Search] Total scraped: ${scrapedProperties.length}`
       );
 
       let properties =
@@ -719,46 +1242,73 @@ export const autonomousSearch =
           normalizeProperty
         );
 
+      const bedroomReq =
+        hasBedroomRequirement(criteria);
+      const bathroomReq =
+        hasBathroomRequirement(criteria);
+
       /*
-       * Bedroom filter.
+       * Property type filter.
        */
-      if (criteria.bedrooms > 0) {
-        const bedroomFiltered =
-          properties.filter(
-            (property) =>
-              Number(
-                property.bedrooms || 0
-              ) >= criteria.bedrooms
-          );
+      if (
+        criteria.propertyType &&
+        criteria.propertyType !== 'all'
+      ) {
+        properties = properties.filter(
+          (property) => {
+            const propType = (
+              property.type ||
+              property.propertyType ||
+              ''
+            )
+              .toLowerCase()
+              .trim();
 
-        console.log(
-          `[AI Search] Bedroom filter (${criteria.bedrooms}+): ${bedroomFiltered.length}`
-        );
-
-        console.log(
-          '[AI Search] Bedroom-matched listings:'
-        );
-
-        bedroomFiltered.forEach(
-          (property, index) => {
-            console.log(
-              `[${index + 1}]`,
-              {
-                title:
-                  property.title,
-                price:
-                  property.price,
-                bedrooms:
-                  property.bedrooms,
-                location:
-                  property.location,
-              }
+            return (
+              propType ===
+                criteria.propertyType ||
+              propType.includes(
+                criteria.propertyType
+              ) ||
+              criteria.propertyType.includes(
+                propType
+              )
             );
           }
         );
+      }
 
-        properties =
-          bedroomFiltered;
+      /*
+       * Bedroom filter.
+       */
+      if (bedroomReq) {
+        const bedroomFiltered =
+          properties.filter((property) =>
+            matchesBedroomFilter(
+              property.bedrooms,
+              criteria
+            )
+          );
+
+        const bedDesc =
+          criteria.bedroomFilterType ===
+          'or'
+            ? `${criteria.bedroomOptions.join(
+                '/'
+              )}`
+            : criteria.bedroomFilterType ===
+              'range'
+              ? `${criteria.bedroomMin}-${criteria.bedroomMax}`
+              : criteria.bedroomFilterType ===
+                'minimum'
+                ? `${criteria.bedrooms}+`
+                : `${criteria.bedrooms}`;
+
+        console.log(
+          `[AI Search] Bedroom filter: ${bedDesc} ${criteria.bedroomFilterType} → ${bedroomFiltered.length}`
+        );
+
+        properties = bedroomFiltered;
       }
 
       /*
@@ -772,21 +1322,34 @@ export const autonomousSearch =
       /*
        * Bathroom filter.
        */
-      if (criteria.bathrooms > 0) {
+      if (bathroomReq) {
         const bathroomFiltered =
-          properties.filter(
-            (property) =>
-              Number(
-                property.bathrooms || 0
-              ) >= criteria.bathrooms
+          properties.filter((property) =>
+            matchesBathroomFilter(
+              property.bathrooms,
+              criteria
+            )
           );
 
+        const bathDesc =
+          criteria.bathroomFilterType ===
+          'or'
+            ? `${criteria.bathroomOptions.join(
+                '/'
+              )}`
+            : criteria.bathroomFilterType ===
+              'range'
+              ? `${criteria.bathroomMin}-${criteria.bathroomMax}`
+              : criteria.bathroomFilterType ===
+                'minimum'
+                ? `${criteria.bathrooms}+`
+                : `${criteria.bathrooms}`;
+
         console.log(
-          `[AI Search] Bathroom filter (${criteria.bathrooms}+): ${bathroomFiltered.length}`
+          `[AI Search] Bathroom filter: ${bathDesc} ${criteria.bathroomFilterType} → ${bathroomFiltered.length}`
         );
 
-        properties =
-          bathroomFiltered;
+        properties = bathroomFiltered;
       }
 
       /*
@@ -804,24 +1367,6 @@ export const autonomousSearch =
                   property.price
                 );
 
-              console.log(
-                '[AI Search] Price check:',
-                {
-                  title:
-                    property.title,
-                  originalPrice:
-                    property.price,
-                  parsedCrores:
-                    priceInCrores,
-                }
-              );
-
-              /*
-               * If price cannot be parsed,
-               * exclude the listing when a budget
-               * constraint is specified, because we
-               * cannot confirm it is within range.
-               */
               if (
                 priceInCrores === 0
               ) {
@@ -850,20 +1395,28 @@ export const autonomousSearch =
             }
           );
 
-        properties =
-          budgetFiltered;
+        let budgetDesc = '';
+        if (
+          criteria.minBudgetInCrores >
+            0 &&
+          criteria.maxBudgetInCrores > 0
+        ) {
+          budgetDesc = `${criteria.minBudgetInCrores}-${criteria.maxBudgetInCrores} crore`;
+        } else if (
+          criteria.maxBudgetInCrores > 0
+        ) {
+          budgetDesc = `<= ${criteria.maxBudgetInCrores} crore`;
+        } else if (
+          criteria.minBudgetInCrores > 0
+        ) {
+          budgetDesc = `>= ${criteria.minBudgetInCrores} crore`;
+        }
 
         console.log(
-          '[AI Search] Budget filter:',
-          {
-            min:
-              criteria.minBudgetInCrores,
-            max:
-              criteria.maxBudgetInCrores,
-            results:
-              properties.length,
-          }
+          `[AI Search] Budget filter: ${budgetDesc} → ${budgetFiltered.length}`
         );
+
+        properties = budgetFiltered;
       }
 
       /*
@@ -873,81 +1426,134 @@ export const autonomousSearch =
         '';
       let isFallback = false;
 
-      if (properties.length === 0) {
+      const bedroomText =
+        getBedroomText(criteria);
+      const bathroomText =
+        getBathroomText(criteria);
+
+      const requirementParts = [];
+      if (bedroomText)
+        requirementParts.push(
+          bedroomText
+        );
+      if (bathroomText)
+        requirementParts.push(
+          bathroomText
+        );
+      const requirementText =
+        requirementParts.length > 0
+          ? requirementParts.join(' and ')
+          : 'your';
+
+      if (
+        properties.length === 0
+      ) {
         if (
-          bedroomMatchedProperties.length === 0
+          bedroomMatchedProperties.length ===
+          0
         ) {
           const cityList =
-            criteria.cities.join(', ');
-          const requirementParts = [];
-          if (criteria.bedrooms > 0) {
-            requirementParts.push(`${criteria.bedrooms} bedroom`);
-          }
-          if (criteria.bathrooms > 0) {
-            requirementParts.push(`${criteria.bathrooms} bathroom`);
-          }
-          const requirementText = requirementParts.length > 0
-            ? requirementParts.join(' and ')
-            : 'your';
+            criteria.cities.join(
+              ', '
+            );
+
           searchSummary =
             `No properties matching your ${requirementText} requirement were found in ${cityList}.`;
         } else {
           const reqParts = [];
-          if (criteria.bedrooms > 0) reqParts.push(`${criteria.bedrooms}+ bedroom`);
-          if (criteria.bathrooms > 0) reqParts.push(`${criteria.bathrooms}+ bathroom`);
-          const reqText = reqParts.length > 0 ? reqParts.join(' and ') : 'matching';
+          if (bedroomText)
+            reqParts.push(bedroomText);
+          if (bathroomText)
+            reqParts.push(bathroomText);
+          const reqText =
+            reqParts.length > 0
+              ? reqParts.join(' and ')
+              : 'matching';
 
           let budgetText = '';
-          if (criteria.maxBudgetInCrores > 0) {
+          if (
+            criteria.maxBudgetInCrores >
+            0
+          ) {
             budgetText = `under Rs. ${criteria.maxBudgetInCrores} Crore`;
-          } else if (criteria.minBudgetInCrores > 0) {
+          } else if (
+            criteria.minBudgetInCrores >
+            0
+          ) {
             budgetText = `above Rs. ${criteria.minBudgetInCrores} Crore`;
           }
 
-          const priceRange = bedroomMatchedProperties
-            .map((p) => extractPriceInCrores(p.price))
-            .filter((p) => p > 0);
+          const priceRange =
+            bedroomMatchedProperties
+              .map((p) =>
+                extractPriceInCrores(
+                  p.price
+                )
+              )
+              .filter((p) => p > 0);
 
-          if (priceRange.length > 0) {
-            const minPrice = Math.min(...priceRange);
-            const maxPrice = Math.max(...priceRange);
+          if (
+            priceRange.length > 0
+          ) {
+            const minPrice =
+              Math.min(...priceRange);
+            const maxPrice =
+              Math.max(...priceRange);
 
             searchSummary = budgetText
-              ? `No ${reqText} properties found ${budgetText}. Showing closest alternatives (Rs. ${minPrice}–${maxPrice} Crore):`
-              : `No ${reqText} properties found. Showing closest alternatives (Rs. ${minPrice}–${maxPrice} Crore):`;
+              ? `No ${reqText} properties found ${budgetText}. Showing closest alternatives (Rs. ${minPrice}\u2013${maxPrice} Crore).`
+              : `No ${reqText} properties found. Showing closest alternatives (Rs. ${minPrice}\u2013${maxPrice} Crore).`;
           } else {
-            searchSummary = `No exact matches found. Showing closest ${reqText} alternatives:`;
+            searchSummary = `No exact matches found. Showing the closest alternatives.`;
           }
 
           isFallback = true;
 
-          /*
-           * Sort fallback results by closeness to budget.
-           * If user specified max budget, show properties
-           * closest to that max from above.
-           * If user specified min budget, show properties
-           * closest to that min from below.
-           * Otherwise just sort by closest to middle of range.
-           */
           const targetBudget =
-            criteria.maxBudgetInCrores > 0
+            criteria.maxBudgetInCrores >
+            0
               ? criteria.maxBudgetInCrores
-              : criteria.minBudgetInCrores > 0
+              : criteria.minBudgetInCrores >
+                  0
                 ? criteria.minBudgetInCrores
                 : 0;
 
-          properties = bedroomMatchedProperties
-            .sort((a, b) => {
-              const aPrice = extractPriceInCrores(a.price);
-              const bPrice = extractPriceInCrores(b.price);
+          const sortedFallback =
+            bedroomMatchedProperties
+              .sort((a, b) => {
+                const aPrice =
+                  extractPriceInCrores(
+                    a.price
+                  );
+                const bPrice =
+                  extractPriceInCrores(
+                    b.price
+                  );
 
-              if (targetBudget > 0) {
-                return Math.abs(aPrice - targetBudget) - Math.abs(bPrice - targetBudget);
-              }
+                if (
+                  targetBudget > 0
+                ) {
+                  return (
+                    Math.abs(
+                      aPrice -
+                        targetBudget
+                    ) -
+                    Math.abs(
+                      bPrice -
+                        targetBudget
+                    )
+                  );
+                }
 
-              return aPrice - bPrice;
-            })
-            .slice(0, 10);
+                return aPrice - bPrice;
+              });
+
+          properties =
+            distributeFairly(
+              sortedFallback,
+              criteria.cities,
+              MAX_RESULTS
+            );
         }
       } else {
         const cityList =
@@ -958,23 +1564,44 @@ export const autonomousSearch =
               ? 'y'
               : 'ies'
           } in ${cityList}.`;
+
+        properties = distributeFairly(
+          properties,
+          criteria.cities,
+          MAX_RESULTS
+        );
       }
 
-      /*
-       * Limit results shown to frontend.
-       */
-      properties =
-        properties.slice(0, 10);
-
       console.log(
-        '[AI Search] Search summary:',
-        searchSummary
+        `[AI Search] Search summary: ${searchSummary}`
       );
 
+      if (
+        criteria.cities.length > 1
+      ) {
+        console.log(
+          '[AI Search] Final result distribution:'
+        );
+
+        for (
+          const city of criteria.cities
+        ) {
+          const count =
+            properties.filter(
+              (p) =>
+                (p.city || '')
+                  .toLowerCase() ===
+                city.toLowerCase()
+            ).length;
+
+          console.log(
+            `  ${city}: ${count}`
+          );
+        }
+      }
+
       console.log(
-        '[AI Search] Returning',
-        properties.length,
-        'properties'
+        `[AI Search] Returning ${properties.length} properties`
       );
 
       console.log(
